@@ -1,0 +1,738 @@
+#!/usr/bin/env bash
+set -euo pipefail
+VERSION="0.1.0"
+
+# One INDEX.md entry. The dash may be an em dash, an en dash or a hyphen;
+# `memory index` always writes the em dash. Passed to awk through ENVIRON
+# because `awk -v` would reinterpret the backslashes.
+INDEX_ENTRY_RE='^- \[[a-z0-9][a-z0-9-]*\]\([a-z0-9][a-z0-9-]*\.md\) (—|–|-) (gotcha|decision|convention|context|reference): .+$'
+export INDEX_ENTRY_RE
+INDEX_TEMP_FILES=()
+
+# Make a relative store location independent of later directory changes.  The
+# store itself is canonicalized by init before it is used as a link target.
+MEMORY_HOME="${AGENT_MEMORY_HOME:-$HOME/.agent-memory}"
+case "$MEMORY_HOME" in
+  /*) ;;
+  *) MEMORY_HOME="$(pwd -P)/$MEMORY_HOME" ;;
+esac
+
+usage() {
+  cat <<'EOF'
+usage: memory <command> [args]        (memory --version prints the version)
+
+commands:
+  init [workspace] [--name <project-name>]  set up .memory/ for this project
+  link-group <group>                        link a group's shared memory
+  unlink-group <group>                      remove a group link
+  index                                     rebuild every INDEX.md from fact frontmatter
+  status                                    levels, fact counts, unlinked groups, backup state
+  grep <pattern> [grep opts]                search all linked levels (follows the symlinks)
+  doctor                                    check symlinks, indexes, frontmatter
+  backup [--push]                           commit (and push) the store
+  install-opencode                          install the global OpenCode plugin
+EOF
+}
+
+die() { echo "memory: $*" >&2; exit 1; }
+
+canonical_path() {
+  local path="$1" dir target
+  while [ -L "$path" ]; do
+    dir="$(cd -P "$(dirname "$path")" && pwd -P)" || return 1
+    target="$(readlink "$path")"
+    case "$target" in /*) path="$target" ;; *) path="$dir/$target" ;; esac
+  done
+  dir="$(cd -P "$(dirname "$path")" && pwd -P)" || return 1
+  printf '%s/%s\n' "$dir" "$(basename "$path")"
+}
+
+valid_slug() { [[ "$1" =~ ^[a-z0-9][a-z0-9-]*$ ]]; }
+
+require_slug() {
+  local kind="$1" value="$2"
+  valid_slug "$value" || die "invalid $kind '$value': use lowercase letters, digits, and hyphens"
+}
+
+# Canonicalize a direct store entry even if that entry itself is missing.  Its
+# parent must exist, which is also required before it can safely be recreated.
+canonical_entry() {
+  local path="$1" parent
+  case "$path" in /*) ;; *) return 1 ;; esac
+  # Resolve a present final component as well: a store entry may itself be a
+  # symlink, and containment must apply to its real destination, not its text.
+  if [ -e "$path" ]; then
+    cd -P "$path" 2>/dev/null && pwd -P
+    return
+  fi
+  parent="$(cd -P "$(dirname "$path")" 2>/dev/null && pwd -P)" || return 1
+  printf '%s/%s\n' "$parent" "$(basename "$path")"
+}
+
+is_in_store() {
+  case "$1" in "$STORE_HOME"|"$STORE_HOME"/*) return 0 ;; *) return 1 ;; esac
+}
+
+# Prints the canonical target only when an absolute symlink points into the
+# canonical store.  Callers must not write through a link until this succeeds.
+safe_link_target() {
+  local link="$1" target resolved
+  [ -L "$link" ] || return 1
+  target="$(readlink "$link")"
+  case "$target" in /*) ;; *) return 1 ;; esac
+  resolved="$(canonical_entry "$target")" || return 1
+  is_in_store "$resolved" || return 1
+  printf '%s\n' "$resolved"
+}
+
+ensure_global_gitignore() {
+  local f origin source
+  f="$(git config --global --path --get core.excludesfile 2>/dev/null || true)"
+  if [ -z "$f" ]; then
+    f="${XDG_CONFIG_HOME:-$HOME/.config}/git/ignore"
+  else
+    case "$f" in
+      /*) ;;
+      *)
+        origin="$(git config --global --show-origin --get core.excludesfile 2>/dev/null || true)"
+        source="${origin%%$'\t'*}"
+        source="${source#file:}"
+        [ -n "$source" ] || die "cannot resolve global core.excludesfile"
+        f="$(dirname "$source")/$f"
+        ;;
+    esac
+  fi
+  f="${f/#\~/$HOME}"
+  if [ -f "$f" ] && grep -qxF '.memory/' "$f"; then return 0; fi
+  mkdir -p "$(dirname "$f")"
+  # Command substitution removes a trailing newline, so an empty result from a
+  # nonempty file means its final byte was already a newline.
+  if [ -s "$f" ] && [ -n "$(tail -c 1 "$f")" ]; then printf '\n' >> "$f"; fi
+  printf '.memory/\n' >> "$f"
+  git config --global core.excludesfile "$f"
+  echo "added '.memory/' to global gitignore ($f)"
+}
+
+cmd_init() {
+  local workspace="" name="" name_given=0 proj existing_workspace g target item found
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name)
+        [ "$name_given" -eq 0 ] || die "--name may be specified only once"
+        [ $# -ge 2 ] && [ -n "$2" ] || die "--name requires a value"
+        name="$2"; name_given=1; shift 2 ;;
+      -*) die "unknown option: $1" ;;
+      *)
+        [ -z "$workspace" ] || die "usage: memory init <workspace> [--name <project-name>]"
+        workspace="$1"; shift ;;
+    esac
+  done
+  if [ -z "$workspace" ]; then
+    {
+      echo "existing workspaces:"
+      if [ -d "$MEMORY_HOME" ]; then
+        found=0
+        for item in "$MEMORY_HOME"/*; do
+          [ -e "$item" ] || continue
+          basename "$item"
+          found=1
+        done
+        [ "$found" -eq 1 ] || echo "  (none)"
+      else
+        echo "  (none)"
+      fi
+      echo "usage: memory init <workspace> [--name <project-name>]"
+    } >&2
+    exit 1
+  fi
+  require_slug "workspace name" "$workspace"
+  if [ "$name_given" -eq 1 ]; then require_slug "project name" "$name"; fi
+
+  # Establish the store canonical path before accepting any existing link.
+  mkdir -p "$MEMORY_HOME"
+  STORE_HOME="$(cd -P "$MEMORY_HOME" && pwd -P)"
+  MEMORY_HOME="$STORE_HOME"
+
+  for g in .memory/project .memory/workspace; do
+    if [ -e "$g" ] || [ -L "$g" ]; then
+      [ -L "$g" ] || die "$g exists but is not a symlink"
+      safe_link_target "$g" >/dev/null || die "unsafe symlink: $g must target an absolute path inside $STORE_HOME"
+    fi
+  done
+
+  local ws="$STORE_HOME/$workspace"
+  if [ -L .memory/workspace ]; then
+    existing_workspace="$(safe_link_target .memory/workspace)" || die "unsafe symlink: .memory/workspace"
+    if [ "$existing_workspace" != "$ws/workspace" ]; then
+      die ".memory/workspace is bound to $existing_workspace; unlink/rebind it explicitly before initializing '$workspace'"
+    fi
+  fi
+
+  if [ ! -d "$STORE_HOME/.git" ]; then git -C "$STORE_HOME" init -q; fi
+  mkdir -p "$ws/workspace" "$ws/groups" "$ws/projects"
+  [ -f "$ws/workspace/INDEX.md" ] || : > "$ws/workspace/INDEX.md"
+
+  local here recorded recorded_canon
+  here="$(pwd -P)"
+  if [ "$name_given" -eq 0 ] && [ -L .memory/project ]; then
+    proj="$(safe_link_target .memory/project)" || die "unsafe symlink: .memory/project"
+  else
+    [ -n "$name" ] || name="$(basename "$here")"
+    require_slug "project name" "$name"
+    proj="$ws/projects/$name"
+    if [ -f "$proj/.project-path" ]; then
+      recorded="$(<"$proj/.project-path")"
+      # Only a path that exists on this machine and is a different directory
+      # is a collision; a foreign or vanished path just gets rebound.
+      if [ -n "$recorded" ] && [ -d "$recorded" ]; then
+        recorded_canon="$(cd -P "$recorded" && pwd -P)"
+        [ "$recorded_canon" = "$here" ] || die "project name '$name' is taken by $recorded; re-run with --name"
+      fi
+    fi
+  fi
+  mkdir -p "$proj"
+  [ -f "$proj/INDEX.md" ] || : > "$proj/INDEX.md"
+  printf '%s\n' "$here" > "$proj/.project-path"
+
+  mkdir -p .memory/groups
+  ln -sfn "$proj" .memory/project
+  ln -sfn "$ws/workspace" .memory/workspace
+
+  # Only repair group entries after proving their existing targets are safe.
+  for g in .memory/groups/*; do
+    [ -L "$g" ] || continue
+    target="$(safe_link_target "$g")" || die "unsafe symlink: $g must target an absolute path inside $STORE_HOME"
+    [ -e "$target" ] || { mkdir -p "$target"; : > "$target/INDEX.md"; }
+  done
+
+  ensure_global_gitignore
+  echo "initialized: project memory at $proj"
+}
+
+cmd_link_group() {
+  [ $# -eq 1 ] || die "usage: memory link-group <group>"
+  local group="$1" ws_dir ws gdir existing
+  require_slug "group name" "$group"
+  [ -L .memory/workspace ] || die "not initialized; run: memory init <workspace>"
+  [ -d "$MEMORY_HOME" ] || die "not initialized; run: memory init <workspace>"
+  STORE_HOME="$(cd -P "$MEMORY_HOME" && pwd -P)"
+  ws_dir="$(safe_link_target .memory/workspace)" || die "unsafe symlink: .memory/workspace must target an absolute path inside $STORE_HOME"
+  [ "$(basename "$ws_dir")" = "workspace" ] && [ "$(dirname "$(dirname "$ws_dir")")" = "$STORE_HOME" ] \
+    || die "invalid workspace symlink: .memory/workspace"
+  ws="$(dirname "$ws_dir")"
+  gdir="$ws/groups/$group"
+  if [ -e ".memory/groups/$group" ] || [ -L ".memory/groups/$group" ]; then
+    [ -L ".memory/groups/$group" ] || die ".memory/groups/$group exists but is not a symlink"
+    existing="$(safe_link_target ".memory/groups/$group")" || die "unsafe symlink: .memory/groups/$group"
+    [ "$existing" = "$gdir" ] || die ".memory/groups/$group is bound to a different group target"
+  fi
+  mkdir -p "$gdir"
+  [ -f "$gdir/INDEX.md" ] || : > "$gdir/INDEX.md"
+  mkdir -p .memory/groups
+  ln -sfn "$gdir" ".memory/groups/$group"
+  echo "linked group '$group'"
+}
+
+cmd_unlink_group() {
+  [ $# -eq 1 ] || die "usage: memory unlink-group <group>"
+  local group="$1"
+  require_slug "group name" "$group"
+  [ -L ".memory/groups/$group" ] || die "group '$group' is not linked"
+  rm ".memory/groups/$group"
+  echo "unlinked group '$group' (its memory stays in the store)"
+}
+
+# Value of one flat frontmatter key of a fact file; empty when the key or the
+# frontmatter is absent. Only the block between the first two `---` lines is
+# read, so a "description:" in the body is never picked up.
+frontmatter_value() {
+  awk -v k="$2" '
+    NR == 1 { if ($0 != "---") exit; next }
+    /^---$/ { exit }
+    index($0, k ": ") == 1 { print substr($0, length(k) + 3); exit }
+  ' "$1"
+}
+
+# Gregorian calendar validation for a structurally valid YYYY-MM-DD date.
+# Bash arithmetic avoids platform-specific `date` options and 10# prevents
+# leading zeroes from being interpreted as octal.
+valid_calendar_date() {
+  local date="$1" year month day rest y d max
+  case "$date" in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
+    *) return 1 ;;
+  esac
+  year="${date%%-*}"
+  rest="${date#*-}"
+  month="${rest%%-*}"
+  day="${rest#*-}"
+  d=$((10#$day))
+  case "$month" in
+    01|03|05|07|08|10|12) max=31 ;;
+    04|06|09|11) max=30 ;;
+    02)
+      y=$((10#$year))
+      if [ $((y % 4)) -eq 0 ] && { [ $((y % 100)) -ne 0 ] || [ $((y % 400)) -eq 0 ]; }; then
+        max=29
+      else
+        max=28
+      fi
+      ;;
+    *) return 1 ;;
+  esac
+  [ "$d" -ge 1 ] && [ "$d" -le "$max" ]
+}
+
+check_frontmatter() {
+  local f="$1" front created updated description_count type_count created_count updated_count status
+  IFS= read -r front < "$f" || true
+  case "$front" in *$'\r') echo "BAD FRONTMATTER (CRLF line endings): $f"; return ;; esac
+  if [ "$front" != "---" ]; then echo "BAD FRONTMATTER (no opening ---): $f"; return; fi
+  if awk '
+    NR == 1 { next }
+    /\r$/ { crlf=1; exit }
+    /^---$/ { found=1; exit }
+    END {
+      if (crlf) exit 2
+      if (!found) exit 1
+    }
+  ' "$f"; then
+    :
+  else
+    status=$?
+    if [ "$status" -eq 2 ]; then
+      echo "BAD FRONTMATTER (CRLF line endings): $f"
+    else
+      echo "BAD FRONTMATTER (no closing ---): $f"
+    fi
+    return
+  fi
+  front="$(awk 'NR == 1 { next } /^---$/ { exit } { print }' "$f")"
+  description_count="$(grep -c '^description:' <<< "$front" || true)"
+  type_count="$(grep -c '^type:' <<< "$front" || true)"
+  created_count="$(grep -c '^created:' <<< "$front" || true)"
+  created="$(frontmatter_value "$f" created)"
+  [ "$description_count" -eq 1 ] && grep -q '^description: .' <<< "$front" \
+    || echo "BAD FRONTMATTER (missing or duplicate description): $f"
+  [ "$type_count" -eq 1 ] && grep -Eq '^type: (gotcha|decision|convention|context|reference)$' <<< "$front" \
+    || echo "BAD FRONTMATTER (missing or invalid type): $f"
+  [ "$created_count" -eq 1 ] && grep -Eq '^created: [0-9]{4}-[0-9]{2}-[0-9]{2}$' <<< "$front" && valid_calendar_date "$created" \
+    || echo "BAD FRONTMATTER (missing or invalid created date): $f"
+  updated_count="$(grep -c '^updated:' <<< "$front" || true)"
+  if [ "$updated_count" -gt 0 ]; then
+    updated="$(frontmatter_value "$f" updated)"
+    if [ "$updated_count" -ne 1 ] || ! grep -Eq '^updated: [0-9]{4}-[0-9]{2}-[0-9]{2}$' <<< "$front" || ! valid_calendar_date "$updated"; then
+      echo "BAD FRONTMATTER (invalid updated date): $f"; return
+    fi
+    # ISO dates compare correctly as strings.
+    if [ -n "$created" ] && [ "$updated" \< "$created" ]; then
+      echo "BAD FRONTMATTER (updated $updated is before created $created): $f"
+    fi
+  fi
+}
+
+# Prints a reason and returns nonzero unless a fact can be rendered as a valid
+# INDEX.md entry.
+fact_is_usable() {
+  local f="$1" base problems
+  base="$(basename "$f")"
+  if ! valid_slug "${base%.md}"; then
+    echo "invalid fact slug"
+    return 1
+  fi
+  problems="$(check_frontmatter "$f")"
+  if [ -n "$problems" ]; then
+    printf '%s\n' "$problems"
+    return 1
+  fi
+  return 0
+}
+
+check_index() {
+  local index_file="$1"
+  awk -v idx="$index_file" '
+    /^[[:space:]]*$/ { next }
+    {
+      if ($0 !~ ENVIRON["INDEX_ENTRY_RE"]) {
+        print "MALFORMED INDEX ENTRY: " idx ":" NR ": " $0; next
+      }
+      label=$0; sub(/^- \[/, "", label); sub(/\].*$/, "", label)
+      file=$0; sub(/^- \[[^]]*\]\(/, "", file); sub(/\).*$/, "", file)
+      stem=file; sub(/\.md$/, "", stem)
+      if (label != stem) { print "MALFORMED INDEX ENTRY: " idx ":" NR ": label does not match " file; next }
+      if (seen[file]++) print "DUPLICATE INDEX ENTRY: " idx ": " file
+    }
+  ' "$index_file"
+}
+
+index_files() {
+  awk '$0 ~ ENVIRON["INDEX_ENTRY_RE"] { f=$0; sub(/^- \[[^]]*\]\(/, "", f); sub(/\).*$/, "", f); print f }' "$1"
+}
+
+# INDEX.md content for one level, rendered from the facts' frontmatter and
+# sorted by slug with a fixed collation so every machine produces the same
+# bytes. Facts without a usable type/description are skipped with a warning;
+# doctor reports them as NOT IN INDEX / BAD FRONTMATTER.
+render_index() {
+  local level="$1" display="${2:-$1}" f base type desc reason
+  {
+    for f in "$level"/*.md; do
+      [ -e "$f" ] || continue
+      printf '%s\n' "$f"
+    done
+  } | LC_ALL=C sort | while IFS= read -r f; do
+    base="$(basename "$f")"
+    [ "$base" = "INDEX.md" ] && continue
+    if ! reason="$(fact_is_usable "$f")"; then
+      echo "memory: skipping $display/$base: $reason" >&2
+      continue
+    fi
+    type="$(frontmatter_value "$f" type)"
+    desc="$(frontmatter_value "$f" description)"
+    printf -- '- [%s](%s) — %s: %s\n' "${base%.md}" "$base" "$type" "$desc"
+  done
+}
+
+cleanup_index_temps() {
+  local temp
+  [ "${#INDEX_TEMP_FILES[@]}" -gt 0 ] || return 0
+  for temp in "${INDEX_TEMP_FILES[@]}"; do
+    rm -f "$temp"
+  done
+}
+
+cmd_index() {
+  [ $# -eq 0 ] || die "usage: memory index"
+  [ -d .memory ] || die "no .memory/ here (run 'memory init <workspace>' first)"
+  [ -d "$MEMORY_HOME" ] || die "no store at $MEMORY_HOME (run 'memory init' first)"
+  STORE_HOME="$(cd -P "$MEMORY_HOME" && pwd -P)"
+  local link target level temp n i
+  local -a levels=() labels=() temps=()
+  if { [ ! -e .memory/project ] && [ ! -L .memory/project ]; } && \
+     { [ ! -e .memory/workspace ] && [ ! -L .memory/workspace ]; }; then
+    die "no usable linked levels"
+  fi
+  for link in .memory/project .memory/workspace; do
+    target="$(safe_link_target "$link")" || die "invalid required memory link: $link"
+    [ -d "$target" ] || die "broken required memory link: $link"
+    levels+=("$target")
+    labels+=("$link")
+  done
+  for link in .memory/groups/*; do
+    [ -e "$link" ] || [ -L "$link" ] || continue
+    target="$(safe_link_target "$link")" || die "invalid group memory link: $link"
+    [ -d "$target" ] || die "broken group memory link: $link"
+    levels+=("$target")
+    labels+=("$link")
+  done
+  [ "${#levels[@]}" -gt 0 ] || die "no usable linked levels"
+  i=0
+  while [ "$i" -lt "${#levels[@]}" ]; do
+    level="${levels[$i]}"
+    [ ! -d "$level/INDEX.md" ] \
+      || die "invalid index destination: ${labels[$i]}/INDEX.md is a directory"
+    i=$((i + 1))
+  done
+
+  INDEX_TEMP_FILES=()
+  trap 'cleanup_index_temps' EXIT
+  trap 'cleanup_index_temps; exit 1' HUP INT TERM
+  i=0
+  while [ "$i" -lt "${#levels[@]}" ]; do
+    level="${levels[$i]}"
+    temp="$(mktemp "$level/.memory-index.XXXXXX")" || die "cannot create temporary index in $level"
+    INDEX_TEMP_FILES+=("$temp")
+    if ! render_index "$level" "${labels[$i]}" > "$temp"; then
+      die "failed to render index for ${labels[$i]}"
+    fi
+    temps+=("$temp")
+    i=$((i + 1))
+  done
+  i=0
+  while [ "$i" -lt "${#levels[@]}" ]; do
+    level="${levels[$i]}"
+    if ! mv "${temps[$i]}" "$level/INDEX.md"; then
+      die "failed to publish index for ${labels[$i]}"
+    fi
+    n="$(grep -c '^- \[' "$level/INDEX.md" || true)"
+    echo "indexed ${labels[$i]} ($n facts)"
+    i=$((i + 1))
+  done
+  INDEX_TEMP_FILES=()
+  trap - EXIT HUP INT TERM
+}
+
+doctor_project_hints() {
+  local p pp linked
+  for p in "$STORE_HOME"/*/projects/*/; do
+    [ -d "$p" ] || continue
+    p="${p%/}"; pp=""
+    [ -f "$p/.project-path" ] && pp="$(<"$p/.project-path")"
+    [ -n "$pp" ] && [ -d "$pp" ] || continue
+    linked="$(safe_link_target "$pp/.memory/project" 2>/dev/null || true)"
+    [ -n "$linked" ] && [ "$linked" != "$p" ] \
+      && echo "PROJECT PATH HINT (possible collision): $p records $pp, which links elsewhere"
+  done
+  return 0
+}
+
+# Classify one .memory/ entry.  Prints one problem line and returns 1, or
+# prints nothing and returns 0 when the link is usable.  Order matters:
+# a relative target is unsafe by design, a target whose parent does not exist
+# is broken (not unsafe), and only a resolvable target outside the store is
+# reported as unsafe.
+check_link() {
+  local link="$1" target resolved
+  if [ ! -e "$link" ] && [ ! -L "$link" ]; then echo "MISSING LINK: $link"; return 1; fi
+  if [ ! -L "$link" ]; then echo "NOT A SYMLINK: $link"; return 1; fi
+  target="$(readlink "$link")"
+  case "$target" in
+    /*) ;;
+    *) echo "UNSAFE SYMLINK: $link -> $target (relative target)"; return 1 ;;
+  esac
+  if ! resolved="$(canonical_entry "$target")"; then
+    echo "BROKEN: $link -> $target (target directory does not exist)"; return 1
+  fi
+  if ! is_in_store "$resolved"; then
+    echo "UNSAFE SYMLINK: $link -> $target (outside $STORE_HOME)"; return 1
+  fi
+  if [ ! -e "$link" ]; then echo "BROKEN: $link -> $target"; return 1; fi
+  return 0
+}
+
+# Description text of the INDEX.md entry for one file (after "type: ").
+index_description() {
+  awk -v want="$2" '$0 ~ ENVIRON["INDEX_ENTRY_RE"] {
+    f=$0; sub(/^- \[[^]]*\]\(/, "", f); sub(/\).*$/, "", f)
+    if (f == want) { d=$0; sub(/^[^:]*: /, "", d); print d; exit }
+  }' "$1"
+}
+
+# A [[slug]] resolves if any linked level has slug.md.
+wiki_target_exists() {
+  local slug="$1" level
+  for level in .memory/project .memory/workspace .memory/groups/*; do
+    [ -f "$level/$slug.md" ] && return 0
+  done
+  return 1
+}
+
+# Hygiene findings that should not fail doctor: printed under a separate header.
+doctor_warnings() {
+  [ -d .memory ] || return 0
+  [ -d "$STORE_HOME" ] || return 0
+  local level f base desc n listed slug
+  for level in .memory/project .memory/workspace .memory/groups/*; do
+    [ -L "$level" ] && [ -d "$level" ] && [ -f "$level/INDEX.md" ] || continue
+    for f in "$level"/*.md; do
+      [ -e "$f" ] || continue
+      base="$(basename "$f")"
+      [ "$base" = "INDEX.md" ] && continue
+      desc="$(frontmatter_value "$f" description)"
+      n=${#desc}
+      [ "$n" -le 120 ] || echo "LONG DESCRIPTION ($n chars > 120): $level/$base"
+      listed="$(index_description "$level/INDEX.md" "$base")"
+      if [ -n "$desc" ] && [ -n "$listed" ] && [ "$listed" != "$desc" ]; then
+        echo "INDEX DESCRIPTION DRIFT: $level/$base (index says '$listed'; run 'memory index')"
+      fi
+      while IFS= read -r slug; do
+        [ -n "$slug" ] || continue
+        wiki_target_exists "$slug" || echo "DANGLING WIKI LINK: $level/$base -> [[$slug]]"
+      done < <(grep -o '\[\[[a-z0-9-]*\]\]' "$f" | sed 's/^\[\[//; s/\]\]$//' | sort -u)
+    done
+  done
+  return 0
+}
+
+doctor_problems() {
+  [ -d .memory ] || return 0
+  if [ ! -d "$STORE_HOME" ]; then
+    echo "STORE MISSING: $STORE_HOME (restore it or set AGENT_MEMORY_HOME)"
+    return 0
+  fi
+  local link level f base name listed
+  local -a levels=()
+  for link in .memory/project .memory/workspace; do
+    if check_link "$link"; then levels+=("$link"); fi
+  done
+  for link in .memory/groups/*; do
+    [ -L "$link" ] || continue
+    if check_link "$link"; then levels+=("$link"); fi
+  done
+  # bash < 4.4 aborts on "${levels[@]}" when the array is empty under set -u.
+  [ "${#levels[@]}" -gt 0 ] || return 0
+  for level in "${levels[@]}"; do
+    [ -f "$level/INDEX.md" ] || { echo "MISSING INDEX: $level/INDEX.md"; continue; }
+    check_index "$level/INDEX.md"
+    for f in "$level"/*.md; do
+      [ -e "$f" ] || continue
+      base="$(basename "$f")"
+      [ "$base" = "INDEX.md" ] && continue
+      listed=0
+      while IFS= read -r name; do
+        if [ "$name" = "$base" ]; then listed=1; break; fi
+      done <<< "$(index_files "$level/INDEX.md")"
+      [ "$listed" -eq 1 ] || echo "NOT IN INDEX: $level/$base"
+      check_frontmatter "$f"
+    done
+    while IFS= read -r name; do
+      [ -f "$level/$name" ] || echo "MISSING FILE: $level/$name (listed in INDEX.md)"
+    done < <(index_files "$level/INDEX.md")
+  done
+  return 0
+}
+
+cmd_doctor() {
+  [ $# -eq 0 ] || die "usage: memory doctor"
+  if [ ! -d .memory ]; then
+    echo "no .memory/ in $(pwd -P); nothing to check (run 'memory init <workspace>' to set up memory)"
+    return 0
+  fi
+  local problems hints warnings
+  [ -d "$MEMORY_HOME" ] && STORE_HOME="$(cd -P "$MEMORY_HOME" && pwd -P)" || STORE_HOME="$MEMORY_HOME"
+  problems="$(doctor_problems)"
+  hints="$(doctor_project_hints)"
+  warnings="$(doctor_warnings)"
+  [ -z "$hints" ] || { echo "project-path hints (not orphan detection):"; printf '%s\n' "$hints"; }
+  [ -z "$warnings" ] || { echo "warnings (not failures):"; printf '%s\n' "$warnings"; }
+  if [ -n "$problems" ]; then printf '%s\n' "$problems"; die "problems found"; fi
+  echo "OK"
+}
+
+# Number of fact files in a level directory (INDEX.md excluded).
+count_facts() {
+  local n=0 f
+  for f in "$1"/*.md; do
+    [ -e "$f" ] || continue
+    [ "$(basename "$f")" = "INDEX.md" ] && continue
+    n=$((n + 1))
+  done
+  echo "$n"
+}
+
+cmd_status() {
+  [ $# -eq 0 ] || die "usage: memory status"
+  [ -d .memory ] || die "no .memory/ here (run 'memory init <workspace>' first)"
+  [ -d "$MEMORY_HOME" ] || die "store missing: $MEMORY_HOME (set AGENT_MEMORY_HOME or restore it)"
+  STORE_HOME="$(cd -P "$MEMORY_HOME" && pwd -P)"
+  local ws_dir ws proj g name target top linked=" " other="" uncommitted last
+  ws_dir="$(safe_link_target .memory/workspace)" || die "unsafe or broken symlink: .memory/workspace (run 'memory doctor')"
+  [ -d "$ws_dir" ] || die "unsafe or broken symlink: .memory/workspace (run 'memory doctor')"
+  proj="$(safe_link_target .memory/project)" || die "unsafe or broken symlink: .memory/project (run 'memory doctor')"
+  [ -d "$proj" ] || die "unsafe or broken symlink: .memory/project (run 'memory doctor')"
+  ws="$(dirname "$ws_dir")"
+  echo "store:      $STORE_HOME"
+  echo "workspace:  $(basename "$ws")  ($(count_facts "$ws_dir") facts)"
+  echo "project:    $(basename "$proj")  ($(count_facts "$proj") facts)  -> $proj"
+  for g in .memory/groups/*; do
+    [ -L "$g" ] || continue
+    name="$(basename "$g")"
+    target="$(safe_link_target "$g" 2>/dev/null || true)"
+    if [ -n "$target" ] && [ -d "$target" ]; then
+      echo "group:      $name  ($(count_facts "$target") facts)"
+      linked="$linked$name "
+    else
+      echo "group:      $name  (UNSAFE OR BROKEN LINK — run 'memory doctor')"
+    fi
+  done
+  # Groups that exist in this workspace but are not linked here: the nudge to
+  # put shared facts where siblings can see them.
+  for g in "$ws"/groups/*/; do
+    [ -d "$g" ] || continue
+    name="$(basename "$g")"
+    case "$linked" in *" $name "*) ;; *) other="$other $name" ;; esac
+  done
+  [ -z "$other" ] || echo "not linked: ${other# }  (memory link-group <group>)"
+  top="$(git -C "$STORE_HOME" rev-parse --show-toplevel 2>/dev/null || true)"
+  if [ -n "$top" ] && top="$(cd -P "$top" && pwd -P)" && [ "$top" = "$STORE_HOME" ]; then
+    uncommitted="$(git -C "$STORE_HOME" status --porcelain --untracked-files=all | wc -l | tr -d ' ')"
+    last="$(git -C "$STORE_HOME" log -1 --format=%cd --date=short 2>/dev/null || echo never)"
+    if [ "$uncommitted" -eq 0 ]; then
+      echo "backup:     last $last, store clean"
+    else
+      echo "backup:     last $last, $uncommitted uncommitted path(s) — run 'memory backup'"
+    fi
+  else
+    echo "backup:     unavailable (store is not a git repository)"
+  fi
+}
+
+# Full-text search over every linked level. Plain `rg`/`grep -r` never see
+# .memory/ (gitignored symlinks); validated root paths let `grep -r` search
+# them without following nested symlinks.
+cmd_grep() {
+  [ $# -ge 1 ] || die "usage: memory grep <pattern> [extra grep options]"
+  [ -d .memory ] || die "no .memory/ here (run 'memory init <workspace>' first)"
+  [ -d "$MEMORY_HOME" ] || die "store missing: $MEMORY_HOME (set AGENT_MEMORY_HOME or restore it)"
+  STORE_HOME="$(cd -P "$MEMORY_HOME" && pwd -P)"
+  local pattern="$1" d target rc=0
+  shift
+  local -a dirs=()
+  for d in .memory/project .memory/workspace; do
+    target="$(safe_link_target "$d")" || die "unsafe or broken symlink: $d (run 'memory doctor')"
+    [ -d "$target" ] || die "unsafe or broken symlink: $d (run 'memory doctor')"
+    dirs+=("$d/")
+  done
+  for d in .memory/groups/*; do
+    [ -L "$d" ] || continue
+    target="$(safe_link_target "$d")" || die "unsafe or broken symlink: $d (run 'memory doctor')"
+    [ -d "$target" ] || die "unsafe or broken symlink: $d (run 'memory doctor')"
+    dirs+=("$d/")
+  done
+  grep -r -n -i --exclude='.project-path' "$@" -- "$pattern" "${dirs[@]}" || rc=$?
+  case "$rc" in
+    0) ;;
+    1) echo "no matches for '$pattern'" ;;
+    *) die "grep failed (exit $rc)" ;;
+  esac
+}
+
+cmd_backup() {
+  local push=0
+  case "$#" in 0) ;; 1) [ "$1" = "--push" ] || die "usage: memory backup [--push]"; push=1 ;; *) die "usage: memory backup [--push]" ;; esac
+  [ -d "$MEMORY_HOME/.git" ] || die "no store at $MEMORY_HOME (run 'memory init' first)"
+  git -C "$MEMORY_HOME" add -A
+  if git -C "$MEMORY_HOME" diff --cached --quiet 2>/dev/null && git -C "$MEMORY_HOME" rev-parse -q --verify HEAD >/dev/null; then
+    echo "nothing to back up"
+  else
+    git -C "$MEMORY_HOME" commit -q -m "backup $(date +%Y-%m-%dT%H:%M:%S)" \
+      || die "commit failed in $MEMORY_HOME — is git user.name / user.email configured?"
+    echo "backed up"
+  fi
+  if [ "$push" -eq 1 ]; then git -C "$MEMORY_HOME" remote get-url origin >/dev/null 2>&1 || die "no remote configured (git -C $MEMORY_HOME remote add origin <url>)"; git -C "$MEMORY_HOME" push -q origin HEAD; fi
+}
+
+cmd_install_opencode() {
+  [ $# -eq 0 ] || die "usage: memory install-opencode"
+  local source script config_dir destination current
+  script="$(canonical_path "${BASH_SOURCE[0]}")" || die "cannot resolve CLI path"
+  source="$(cd -P "$(dirname "$script")/.." && pwd -P)/opencode/agent-memory.js"
+  [ -f "$source" ] || die "OpenCode plugin not found at $source"
+  config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/plugins"
+  destination="$config_dir/agent-memory.js"
+  mkdir -p "$config_dir"
+  if [ -L "$destination" ]; then
+    current="$(canonical_path "$destination" 2>/dev/null)" || current=""   # dangling link: replace it
+    [ "$current" = "$source" ] && { echo "OpenCode plugin already installed: $destination"; return 0; }
+    rm "$destination"
+  elif [ -e "$destination" ]; then
+    die "refusing to overwrite non-symlink: $destination"
+  fi
+  ln -s "$source" "$destination"
+  echo "installed OpenCode plugin: $destination (restart OpenCode to load it)"
+}
+
+main() {
+  local cmd="${1:-}"
+  [ $# -gt 0 ] && shift
+  case "$cmd" in
+    init) cmd_init "$@" ;; link-group) cmd_link_group "$@" ;; unlink-group) cmd_unlink_group "$@" ;;
+    index) cmd_index "$@" ;; status) cmd_status "$@" ;; grep) cmd_grep "$@" ;; doctor) cmd_doctor "$@" ;; backup) cmd_backup "$@" ;; install-opencode) cmd_install_opencode "$@" ;;
+    -v|--version) [ $# -eq 0 ] || die "usage: memory --version"; echo "memory $VERSION" ;;
+    -h|--help) [ $# -eq 0 ] || die "usage: memory --help"; usage ;;
+    "") usage >&2; exit 1 ;;
+    *) die "unknown command: $cmd (see 'memory --help')" ;;
+  esac
+}
+
+main "$@"
