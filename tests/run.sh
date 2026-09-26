@@ -11,6 +11,7 @@ setup() {
   TMP="$(mktemp -d)"
   export AGENT_MEMORY_HOME="$TMP/store"
   export HOME="$TMP/home"                 # isolates global git config too
+  unset XDG_CONFIG_HOME                   # CI runners set it; config must follow $HOME
   export GIT_CONFIG_NOSYSTEM=1
   mkdir -p "$HOME"
   git config --global user.email "test@example.com"
