@@ -2,7 +2,6 @@ import { execFile } from "node:child_process"
 import { realpath } from "node:fs/promises"
 import { dirname, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
-import { Plugin } from "@opencode/plugin"
 
 import { registerMemoryRuntime } from "./memory-core.js"
 
@@ -27,9 +26,12 @@ async function logError(entry) {
   }
 }
 
-export default Plugin.define({
+// A plain V2 plugin object ({ id, setup }). `Plugin.define` from
+// @opencode/plugin is an identity function; importing it would make the plugin
+// unloadable when installed as a copied skill with no node_modules next to it.
+export default {
   id: "agent-memory",
   setup(ctx) {
     return registerMemoryRuntime(ctx, { memoryCli, runBackup: runCommand, logError })
   },
-})
+}

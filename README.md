@@ -85,8 +85,8 @@ The snippets do not back up the store — run `memory backup` yourself.
 
 The CLI uses Bash plus standard shell utilities (`grep`, `awk`, `readlink`),
 `git`, and filesystem symlink support. The OpenCode integration uses OpenCode's
-built-in Bun runtime and imports `@opencode/plugin`, which OpenCode V2 provides
-in its config directory; nothing else needs installing.
+built-in Bun runtime and imports only Node built-ins; it has no package
+dependencies.
 
 ## Layout
 

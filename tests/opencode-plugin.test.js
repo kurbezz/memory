@@ -276,9 +276,15 @@ test("swallows rejecting injected error loggers", async (t) => {
   assert.deepEqual(logs, [])
 })
 
-test("entrypoint is a native V2 Plugin.define adapter", async () => {
-  const source = await readFile(new URL("../skills/agent-memory/opencode/agent-memory.js", import.meta.url), "utf8")
-  assert.match(source, /import\s+\{\s*Plugin\s*\}\s+from\s+["']@opencode\/plugin["']/)
-  assert.match(source, /Plugin\.define\(\{\s*id:\s*["']agent-memory["']/s)
+test("entrypoint is a dependency-free native V2 plugin object", async () => {
+  const url = new URL("../skills/agent-memory/opencode/agent-memory.js", import.meta.url)
+  const source = await readFile(url, "utf8")
+  // Only node: builtins and sibling files — the skill is installed as a copy with no node_modules.
+  for (const [, specifier] of source.matchAll(/^import\s.*?from\s+["']([^"']+)["']/gm)) {
+    assert.ok(specifier.startsWith("node:") || specifier.startsWith("./"), `non-bundled import: ${specifier}`)
+  }
   assert.doesNotMatch(source, /experimental\.|@opencode-ai\/plugin|createMemoryPlugin/)
+  const { default: plugin } = await import(url)
+  assert.equal(plugin.id, "agent-memory")
+  assert.equal(typeof plugin.setup, "function")
 })

@@ -7,8 +7,5 @@
   },
   "scripts": {
     "test:opencode": "node --test tests/opencode-plugin.test.js"
-  },
-  "devDependencies": {
-    "@opencode/plugin": "^2.0.7"
   }
 }
