@@ -78,6 +78,8 @@ async function appendMemoryBlock(parts, directory, logger) {
   }
 }
 
+const BACKUP_EVENTS = new Set(["session.execution.succeeded", "session.execution.failed", "session.execution.interrupted"])
+
 export async function registerMemoryRuntime(ctx, { memoryCli, runBackup, logError }) {
   const backups = new Map()
   const controller = new AbortController()
@@ -124,7 +126,9 @@ export async function registerMemoryRuntime(ctx, { memoryCli, runBackup, logErro
   await ctx.session.hook("compaction", inject)
   void (async () => {
     for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
-      if (event.type === "session.idle") void backup(event.properties.sessionID)
+      if (!event || !BACKUP_EVENTS.has(event.type)) continue
+      const sessionID = event.data?.sessionID
+      if (sessionID) void backup(sessionID)
     }
   })().catch((error) => logger("Could not subscribe to OpenCode events", { error: String(error) }))
   return () => controller.abort()

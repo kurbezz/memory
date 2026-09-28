@@ -159,7 +159,7 @@ test("does not duplicate memory blocks when overlapping injections load asynchro
   assert.equal(event.system.filter((part) => part.type === "text" && part.text.includes("<agent-memory>")).length, 1)
 })
 
-test("backs up each idle session location once and aborts its event stream on cleanup", async (t) => {
+test("backs up each execution-succeeded session location once and aborts its event stream on cleanup", async (t) => {
   const root = await workspace(); const events = deferredEvents(); const logs = []; const calls = []
   const ctx = contextFor(root, events, async (input) => {
     calls.push(input)
@@ -167,11 +167,55 @@ test("backs up each idle session location once and aborts its event stream on cl
   }, logs)
   const stop = await registerMemoryRuntime(ctx, { memoryCli: "/tmp/memory", runBackup: ctx.runBackup, logError: ctx.logError })
   t.after(stop)
-  events.push({ type: "session.idle", properties: { sessionID: "s1" } })
+  events.push({ type: "session.execution.succeeded", data: { sessionID: "s1" } })
   await waitFor(() => calls.length === 1)
   assert.deepEqual(calls, [{ command: "/tmp/memory", args: ["backup"], cwd: root }])
   await stop()
   assert.equal(events.aborted(), true)
+})
+
+test("backs up on session.execution.interrupted", async (t) => {
+  const root = await workspace(); const events = deferredEvents(); const logs = []; const calls = []
+  const ctx = contextFor(root, events, async (input) => {
+    calls.push(input)
+    return { exitCode: 0, stdout: "", stderr: "" }
+  }, logs)
+  const stop = await registerMemoryRuntime(ctx, { memoryCli: "/tmp/memory", runBackup: ctx.runBackup, logError: ctx.logError })
+  t.after(stop)
+  events.push({ type: "session.execution.interrupted", data: { sessionID: "s1", reason: "user" } })
+  await waitFor(() => calls.length === 1)
+  assert.deepEqual(calls, [{ command: "/tmp/memory", args: ["backup"], cwd: root }])
+  await stop()
+})
+
+test("ignores unrelated event types like session.step.ended", async (t) => {
+  const root = await workspace(); const events = deferredEvents(); const logs = []; const calls = []
+  const ctx = contextFor(root, events, async (input) => {
+    calls.push(input)
+    return { exitCode: 0, stdout: "", stderr: "" }
+  }, logs)
+  const stop = await registerMemoryRuntime(ctx, { memoryCli: "/tmp/memory", runBackup: ctx.runBackup, logError: ctx.logError })
+  t.after(stop)
+  events.push({ type: "session.step.ended", data: { sessionID: "s1" } })
+  await new Promise((resolve) => setImmediate(resolve))
+  await stop()
+  assert.deepEqual(calls, [])
+})
+
+test("does not crash on malformed events and still backs up valid events afterward", async (t) => {
+  const root = await workspace(); const events = deferredEvents(); const logs = []; const calls = []
+  const ctx = contextFor(root, events, async (input) => {
+    calls.push(input)
+    return { exitCode: 0, stdout: "", stderr: "" }
+  }, logs)
+  const stop = await registerMemoryRuntime(ctx, { memoryCli: "/tmp/memory", runBackup: ctx.runBackup, logError: ctx.logError })
+  t.after(stop)
+  events.push({ type: "session.execution.succeeded" })
+  events.push({ type: "session.idle", properties: { sessionID: "s1" } })
+  events.push({ type: "session.execution.succeeded", data: { sessionID: "s1" } })
+  await waitFor(() => calls.length === 1)
+  assert.deepEqual(calls, [{ command: "/tmp/memory", args: ["backup"], cwd: root }])
+  await stop()
 })
 
 test("does not launch a backup after cleanup while its session lookup is pending", async (t) => {
@@ -189,7 +233,7 @@ test("does not launch a backup after cleanup while its session lookup is pending
   }
   const stop = await registerMemoryRuntime(ctx, { memoryCli: "/tmp/memory", runBackup: ctx.runBackup, logError: ctx.logError })
   t.after(stop)
-  events.push({ type: "session.idle", properties: { sessionID: "s1" } })
+  events.push({ type: "session.execution.succeeded", data: { sessionID: "s1" } })
   await waitFor(() => lookupStarted)
 
   await stop()
@@ -199,7 +243,7 @@ test("does not launch a backup after cleanup while its session lookup is pending
   assert.deepEqual(calls, [])
 })
 
-test("serializes duplicate idle backups by directory while allowing other directories", async (t) => {
+test("serializes duplicate execution-succeeded backups by directory while allowing other directories", async (t) => {
   const first = await workspace(); const second = await workspace()
   const events = deferredEvents(); const logs = []; const calls = []; let release
   const pending = new Promise((resolve) => { release = resolve })
@@ -210,9 +254,9 @@ test("serializes duplicate idle backups by directory while allowing other direct
   }, logs, { s1: first, s2: second })
   const stop = await registerMemoryRuntime(ctx, { memoryCli: "/tmp/memory", runBackup: ctx.runBackup, logError: ctx.logError })
   t.after(stop)
-  events.push({ type: "session.idle", properties: { sessionID: "s1" } })
-  events.push({ type: "session.idle", properties: { sessionID: "s1" } })
-  events.push({ type: "session.idle", properties: { sessionID: "s2" } })
+  events.push({ type: "session.execution.succeeded", data: { sessionID: "s1" } })
+  events.push({ type: "session.execution.succeeded", data: { sessionID: "s1" } })
+  events.push({ type: "session.execution.succeeded", data: { sessionID: "s2" } })
   await waitFor(() => calls.length === 2)
   assert.deepEqual(calls.map((call) => call.cwd).sort(), [first, second].sort())
   release()
@@ -233,8 +277,8 @@ test("isolates index, session lookup, and backup failures with error logs", asyn
 
   await ctx.hooks.get("context")(indexFailure)
   await ctx.hooks.get("compaction")(lookupFailure)
-  events.push({ type: "session.idle", properties: { sessionID: "missing" } })
-  events.push({ type: "session.idle", properties: { sessionID: "s1" } })
+  events.push({ type: "session.execution.succeeded", data: { sessionID: "missing" } })
+  events.push({ type: "session.execution.succeeded", data: { sessionID: "s1" } })
   await waitFor(() => logs.length >= 4)
 
   assert.deepEqual(indexFailure.system, [])
@@ -254,7 +298,7 @@ test("logs nonzero backup results without throwing", async (t) => {
   const stop = await registerMemoryRuntime(ctx, { memoryCli: "/tmp/memory", runBackup: ctx.runBackup, logError: ctx.logError })
   t.after(stop)
 
-  events.push({ type: "session.idle", properties: { sessionID: "s1" } })
+  events.push({ type: "session.execution.succeeded", data: { sessionID: "s1" } })
   await waitFor(() => logs.length === 1)
 
   assert.equal(logs[0].level, "error")
