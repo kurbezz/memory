@@ -24,8 +24,11 @@ from PATH if installed; otherwise call the bundled script by its path
 (`<this skill's directory>/bin/memory`). It handles mechanics only — setting
 up `.memory/` (`init`), linking groups (`link-group`/`unlink-group`),
 consistency checks (`doctor`), OpenCode plugin installation
-(`install-opencode`), and store backup (`backup`). Reading and writing facts
-is always plain file I/O, no CLI needed.
+(`install-opencode`), and store backup (`backup`). `backup` commits with a
+structured message derived from the staged diff (e.g.
+`memory(<project>): add <slug>, ...` or `memory: add N in S scopes` with a
+per-scope body) — nothing to configure, it just describes what changed.
+Reading and writing facts is always plain file I/O, no CLI needed.
 
 The CLI requires Bash, `git`, `grep`, `awk`, `readlink`, and filesystem
 symlink support; it has no server, database, or package-runtime dependency.

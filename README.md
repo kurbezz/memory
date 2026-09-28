@@ -123,6 +123,10 @@ The agent protocol is defined in [`skills/agent-memory/SKILL.md`](skills/agent-m
 - **Sharing**: `memory backup --push` pushes `HEAD` without pulling. Two people
   pushing the same store will conflict; this is a single-writer backup, not a
   sync protocol.
+- **Commit messages**: `backup` builds a structured message from the staged
+  diff, e.g. `memory(some-api): add pool-limits; update retry-policy` for one
+  scope, or `memory: add 3, update 1 in 2 scopes` with a per-scope body when
+  several projects/groups/workspace change together.
 - **Secrets**: `backup` commits everything under the store. Never write
   credentials into facts.
 

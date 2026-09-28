@@ -1131,6 +1131,102 @@ EOF
   fi
 }
 
+test_backup_first_commit_in_fresh_store() {
+  # A fresh store has no HEAD yet; `git diff --cached --name-status` still
+  # works (diffs against the empty tree) and classifies paths correctly.
+  "$MEMORY" init work >/dev/null
+  write_fact_only .memory/project a-fact context "something"
+  "$MEMORY" backup >/dev/null
+  local n msg
+  n="$(git -C "$AGENT_MEMORY_HOME" rev-list --count HEAD)"
+  assert_eq "$n" 1
+  msg="$(git -C "$AGENT_MEMORY_HOME" log -1 --format=%s)"
+  # init's .project-path write lands in the same first commit as the fact,
+  # under the fallback "other" scope, so this is a multi-scope subject.
+  assert_contains "$msg" "add"
+  assert_contains "$msg" "2 scopes"
+}
+
+test_backup_single_scope_add_update_remove_subject() {
+  "$MEMORY" init work >/dev/null
+  write_fact_only .memory/project a-fact context "a"
+  write_fact_only .memory/project b-fact context "b"
+  "$MEMORY" backup >/dev/null
+  # Distinct content keeps git's rename detection from pairing the removed
+  # and added files together.
+  cat > .memory/project/c-fact.md <<'EOF'
+---
+description: a brand new unrelated fact about something else entirely
+type: reference
+created: 2026-09-04
+---
+this body is deliberately unlike anything else in the store so it is
+never mistaken for a rename of another file
+EOF
+  printf 'more\n' >> .memory/project/a-fact.md                # update
+  rm .memory/project/b-fact.md                                # remove
+  "$MEMORY" backup >/dev/null
+  local subj
+  subj="$(git -C "$AGENT_MEMORY_HOME" log -1 --format=%s)"
+  assert_eq "$subj" "memory(some-api): add c-fact; update a-fact; remove b-fact"
+}
+
+test_backup_multiple_scopes_subject_and_body() {
+  "$MEMORY" init work >/dev/null
+  "$MEMORY" link-group grp1 >/dev/null
+  "$MEMORY" backup >/dev/null
+  write_fact_only .memory/project a-fact context "a"
+  write_fact_only .memory/groups/grp1 g-fact context "g"
+  "$MEMORY" backup >/dev/null
+  local subj body
+  subj="$(git -C "$AGENT_MEMORY_HOME" log -1 --format=%s)"
+  assert_eq "$subj" "memory: add 2 in 2 scopes"
+  body="$(git -C "$AGENT_MEMORY_HOME" log -1 --format=%b)"
+  assert_contains "$body" "group:grp1: add g-fact"
+  assert_contains "$body" "some-api: add a-fact"
+  assert_contains "$body" "backup 20"
+}
+
+test_backup_rename_shows_slug_arrow() {
+  "$MEMORY" init work >/dev/null
+  write_fact_only .memory/project a-fact context "a"
+  "$MEMORY" backup >/dev/null
+  mv .memory/project/a-fact.md .memory/project/a-fact-renamed.md
+  "$MEMORY" index >/dev/null
+  "$MEMORY" backup >/dev/null
+  local subj
+  subj="$(git -C "$AGENT_MEMORY_HOME" log -1 --format=%s)"
+  assert_eq "$subj" "memory(some-api): rename a-fact->a-fact-renamed"
+}
+
+test_backup_index_only_reindex_subject() {
+  "$MEMORY" init work >/dev/null
+  write_fact_only .memory/project a-fact context "a"
+  "$MEMORY" backup >/dev/null
+  "$MEMORY" index >/dev/null    # only INDEX.md changes
+  "$MEMORY" backup >/dev/null
+  local subj body
+  subj="$(git -C "$AGENT_MEMORY_HOME" log -1 --format=%s)"
+  assert_eq "$subj" "memory(some-api): reindex"
+  body="$(git -C "$AGENT_MEMORY_HOME" log -1 --format=%b)"
+  assert_contains "$body" "backup 20"
+}
+
+test_backup_long_list_truncates_within_72_chars() {
+  "$MEMORY" init work >/dev/null
+  "$MEMORY" backup >/dev/null
+  local i
+  for i in $(seq 1 20); do
+    write_fact_only .memory/project "fact-$i-with-a-long-slug-name" context "d $i"
+  done
+  "$MEMORY" backup >/dev/null
+  local subj
+  subj="$(git -C "$AGENT_MEMORY_HOME" log -1 --format=%s)"
+  [ "${#subj}" -le 72 ] || fail "subject exceeds 72 chars: $subj"
+  assert_contains "$subj" "memory(some-api): add"
+  assert_contains "$subj" "more"
+}
+
 test_backup_nothing_to_do() {
   "$MEMORY" init work >/dev/null
   "$MEMORY" backup >/dev/null

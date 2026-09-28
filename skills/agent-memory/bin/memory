@@ -688,6 +688,175 @@ cmd_grep() {
   esac
 }
 
+# Builds the structured commit message for `memory backup` from the staged
+# diff. Classifies each changed store path against the store layout
+# `<ws>/projects/<name>/<slug>.md`, `<ws>/groups/<name>/<slug>.md`,
+# `<ws>/workspace/<slug>.md`; anything else becomes scope "other" with the
+# raw path as its "slug". A level's `INDEX.md` is never listed as a fact.
+# `git diff --cached --name-status` diffs against the empty tree when there
+# is no HEAD yet, so this also covers the very first commit into the store.
+backup_commit_message() {
+  git -C "$MEMORY_HOME" diff --cached --name-status -M \
+    | awk -v ts="$(date +%Y-%m-%dT%H:%M:%S)" '
+    BEGIN { FS = "\t" }
+
+    # Classifies one store-relative path. Sets CL_SCOPE / CL_SLUG / CL_ISINDEX.
+    function classify(path,   n, arr) {
+      n = split(path, arr, "/")
+      CL_ISINDEX = 0
+      if (n == 4 && arr[2] == "projects" && arr[4] ~ /\.md$/) {
+        CL_SCOPE = arr[3]; CL_FILE = arr[4]
+      } else if (n == 4 && arr[2] == "groups" && arr[4] ~ /\.md$/) {
+        CL_SCOPE = "group:" arr[3]; CL_FILE = arr[4]
+      } else if (n == 3 && arr[2] == "workspace" && arr[3] ~ /\.md$/) {
+        CL_SCOPE = "workspace:" arr[1]; CL_FILE = arr[3]
+      } else {
+        CL_SCOPE = "other"; CL_FILE = ""; CL_SLUG = path
+        return
+      }
+      if (CL_FILE == "INDEX.md") CL_ISINDEX = 1
+      CL_SLUG = CL_FILE
+      sub(/\.md$/, "", CL_SLUG)
+    }
+
+    function addTo(op, scope, item,   c) {
+      seenScope[scope] = 1
+      c = ++opCount[op, scope]
+      opItem[op, scope, c] = item
+    }
+
+    {
+      code = substr($1, 1, 1)
+      if (code == "R") {
+        classify($3); nscope = CL_SCOPE; nslug = CL_SLUG; nidx = CL_ISINDEX
+        classify($2); oslug = CL_SLUG
+        if (nidx) { indexScope[nscope] = 1; next }
+        addTo("rename", nscope, oslug "->" nslug)
+        totalRename++
+        next
+      }
+      if (code != "A" && code != "M" && code != "D") code = "M"   # defensive fallback
+      classify($2)
+      if (CL_ISINDEX) { indexScope[CL_SCOPE] = 1; next }
+      if (code == "A") { addTo("add", CL_SCOPE, CL_SLUG); totalAdd++ }
+      else if (code == "D") { addTo("remove", CL_SCOPE, CL_SLUG); totalRemove++ }
+      else { addTo("update", CL_SCOPE, CL_SLUG); totalUpdate++ }
+    }
+
+    function joinFirst(op, scope, k,   s, i) {
+      s = ""
+      for (i = 1; i <= k; i++) s = (i == 1) ? opItem[op, scope, i] : s ", " opItem[op, scope, i]
+      return s
+    }
+
+    # Full clause text for one scope: "add a, b; update c; rename x->y; remove d"
+    function fullClause(scope,   parts, np, s, i) {
+      np = 0
+      if (opCount["add", scope] > 0) parts[++np] = "add " joinFirst("add", scope, opCount["add", scope])
+      if (opCount["update", scope] > 0) parts[++np] = "update " joinFirst("update", scope, opCount["update", scope])
+      if (opCount["rename", scope] > 0) parts[++np] = "rename " joinFirst("rename", scope, opCount["rename", scope])
+      if (opCount["remove", scope] > 0) parts[++np] = "remove " joinFirst("remove", scope, opCount["remove", scope])
+      s = (np > 0) ? parts[1] : ""
+      for (i = 2; i <= np; i++) s = s "; " parts[i]
+      return s
+    }
+
+    function countsClause(scope,   parts, np, s, i, c) {
+      np = 0
+      c = opCount["add", scope]; if (c > 0) parts[++np] = "add " c
+      c = opCount["update", scope]; if (c > 0) parts[++np] = "update " c
+      c = opCount["rename", scope]; if (c > 0) parts[++np] = "rename " c
+      c = opCount["remove", scope]; if (c > 0) parts[++np] = "remove " c
+      s = (np > 0) ? parts[1] : ""
+      for (i = 2; i <= np; i++) s = s ", " parts[i]
+      return s
+    }
+
+    function totalItems(scope) {
+      return opCount["add", scope] + opCount["update", scope] + opCount["rename", scope] + opCount["remove", scope]
+    }
+
+    # Subject clause for one scope, showing at most k items in total (in
+    # add/update/rename/remove priority order) with "+N more" for the rest.
+    function truncatedClause(scope, k,   remaining, shown_a, shown_u, shown_r, shown_rm, total, omitted, parts, np, s, i) {
+      remaining = k
+      shown_a = (opCount["add", scope] < remaining) ? opCount["add", scope] : remaining; remaining -= shown_a
+      shown_u = (opCount["update", scope] < remaining) ? opCount["update", scope] : remaining; remaining -= shown_u
+      shown_r = (opCount["rename", scope] < remaining) ? opCount["rename", scope] : remaining; remaining -= shown_r
+      shown_rm = (opCount["remove", scope] < remaining) ? opCount["remove", scope] : remaining; remaining -= shown_rm
+      total = totalItems(scope)
+      omitted = total - k
+      np = 0
+      if (shown_a > 0) parts[++np] = "add " joinFirst("add", scope, shown_a)
+      if (shown_u > 0) parts[++np] = "update " joinFirst("update", scope, shown_u)
+      if (shown_r > 0) parts[++np] = "rename " joinFirst("rename", scope, shown_r)
+      if (shown_rm > 0) parts[++np] = "remove " joinFirst("remove", scope, shown_rm)
+      s = (np > 0) ? parts[1] : ""
+      for (i = 2; i <= np; i++) s = s "; " parts[i]
+      if (omitted > 0) s = (s == "") ? ("+" omitted " more") : (s " +" omitted " more")
+      return s
+    }
+
+    # Best-fitting <= 72-char subject for a single scope: full list, then
+    # progressively fewer items with "+N more", then bare counts.
+    function singleScopeSubject(scope,   full, prefix, k, cand, total) {
+      prefix = "memory(" scope "): "
+      full = prefix fullClause(scope)
+      if (length(full) <= 72) return full
+      total = totalItems(scope)
+      for (k = total - 1; k >= 0; k--) {
+        cand = prefix truncatedClause(scope, k)
+        if (length(cand) <= 72) return cand
+      }
+      return prefix countsClause(scope)
+    }
+
+    function ssort(arr, n,    i, j, tmp) {
+      for (i = 2; i <= n; i++) {
+        tmp = arr[i]; j = i - 1
+        while (j >= 1 && arr[j] > tmp) { arr[j + 1] = arr[j]; j-- }
+        arr[j + 1] = tmp
+      }
+    }
+
+    END {
+      ns = 0
+      for (k in seenScope) scopes[++ns] = k
+      ssort(scopes, ns)
+
+      if (ns == 0) {
+        nis = 0
+        for (k in indexScope) idxScopes[++nis] = k
+        ssort(idxScopes, nis)
+        if (nis == 1) subject = "memory(" idxScopes[1] "): reindex"
+        else subject = "memory: reindex " nis " scopes"
+        print subject
+        print ""
+        print "backup " ts
+        exit
+      }
+
+      if (ns == 1) {
+        subject = singleScopeSubject(scopes[1])
+      } else {
+        pn = 0
+        if (totalAdd > 0) mparts[++pn] = "add " totalAdd
+        if (totalUpdate > 0) mparts[++pn] = "update " totalUpdate
+        if (totalRename > 0) mparts[++pn] = "rename " totalRename
+        if (totalRemove > 0) mparts[++pn] = "remove " totalRemove
+        s = mparts[1]
+        for (i = 2; i <= pn; i++) s = s ", " mparts[i]
+        subject = "memory: " s " in " ns " scopes"
+      }
+
+      print subject
+      print ""
+      for (i = 1; i <= ns; i++) print scopes[i] ": " fullClause(scopes[i])
+      print "backup " ts
+    }
+  '
+}
+
 cmd_backup() {
   local push=0
   case "$#" in 0) ;; 1) [ "$1" = "--push" ] || die "usage: memory backup [--push]"; push=1 ;; *) die "usage: memory backup [--push]" ;; esac
@@ -696,7 +865,9 @@ cmd_backup() {
   if git -C "$MEMORY_HOME" diff --cached --quiet 2>/dev/null && git -C "$MEMORY_HOME" rev-parse -q --verify HEAD >/dev/null; then
     echo "nothing to back up"
   else
-    git -C "$MEMORY_HOME" commit -q -m "backup $(date +%Y-%m-%dT%H:%M:%S)" \
+    local msg
+    msg="$(backup_commit_message)" || die "failed to build commit message"
+    git -C "$MEMORY_HOME" commit -q -m "$msg" \
       || die "commit failed in $MEMORY_HOME — is git user.name / user.email configured?"
     echo "backed up"
   fi
