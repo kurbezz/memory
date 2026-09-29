@@ -798,13 +798,14 @@ backup_commit_message() {
     }
 
     # Best-fitting <= 72-char subject for a single scope: full list, then
-    # progressively fewer items with "+N more", then bare counts.
+    # progressively fewer items with "+N more" (always naming at least one
+    # fact), then bare counts such as "add 1".
     function singleScopeSubject(scope,   full, prefix, k, cand, total) {
       prefix = "memory(" scope "): "
       full = prefix fullClause(scope)
       if (length(full) <= 72) return full
       total = totalItems(scope)
-      for (k = total - 1; k >= 0; k--) {
+      for (k = total - 1; k >= 1; k--) {
         cand = prefix truncatedClause(scope, k)
         if (length(cand) <= 72) return cand
       }

@@ -1227,6 +1227,16 @@ test_backup_long_list_truncates_within_72_chars() {
   assert_contains "$subj" "more"
 }
 
+test_backup_single_long_slug_falls_back_to_counts() {
+  "$MEMORY" init work >/dev/null
+  "$MEMORY" backup >/dev/null
+  write_fact_only .memory/project "single-leg-then-two-leg-exchange-reimport-with-extra-words" context "d"
+  "$MEMORY" backup >/dev/null
+  local subj
+  subj="$(git -C "$AGENT_MEMORY_HOME" log -1 --format=%s)"
+  assert_eq "$subj" "memory(some-api): add 1"
+}
+
 test_backup_nothing_to_do() {
   "$MEMORY" init work >/dev/null
   "$MEMORY" backup >/dev/null
