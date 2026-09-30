@@ -93,6 +93,10 @@ workspace.
   `--print-config` shows the exact config and prompt without running anything.
   `--if-changed` skips the run when nothing was committed to the store since
   the last successful run, for use from a nightly scheduler (launchd, cron).
+  After the first successful run, later runs are incremental: the agent gets
+  the list of facts added or changed since the last run and checks only those
+  against the rest (more than 150 changed facts means a full run). `--full`
+  forces a full pass over the store.
   Without `--model` it uses `AGENT_MEMORY_DREAM_MODEL`, or OpenCode's default
   model. The consolidation is judgment work, so a strong model is worth it: in
   testing, a small model read 35 of 500 facts and changed only descriptions.
@@ -102,7 +106,8 @@ workspace.
 The unattended run is sandboxed. The agent can read anywhere except secret
 paths (`~/.ssh`, `~/.aws`, `.env` files, ...), write only inside the store
 (never `.git`), and run only `memory dream --report`, read-only git commands
-(`log`, `show`, `diff`, `status`) and `git add/mv/rm` in the store. There is no
+(`log`, `show`, `diff`, `status`, `rev-list`, `ls-tree`, `blame`) and
+`git add/mv/rm` in the store (the only way it can delete or move a fact). There is no
 `cat`/`rg` in the shell: file reading goes through OpenCode's own read tools,
 where the secret-path rules apply. Web access is allowed for checking references,
 and the only subagent is a read-only checker. The boundary is enforced through

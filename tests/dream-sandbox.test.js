@@ -59,6 +59,8 @@ test("dream agent: allowed shell commands", () => {
     `git -C /Users/u/work/app log --format=%h --date=short -3 origin/production`,
     `rtk git -C /Users/u/work/app log --format="%h %cd %s" --date=short -3 origin/production`,
     `git -C /Users/u/work/app ls-tree origin/master --name-only`,
+    `git -C /Users/u/work/app rev-list --count origin/production..origin/master`,
+    `git -C ${STORE} mv work/projects/a/x.md work/groups/g/x.md`,
     `git -C /Users/u/work/app show HEAD:app/config.py`,
     `readlink /Users/u/work/app/.memory/project`,
   ]) assert.ok(dream("shell", cmd), `should allow: ${cmd}`);
@@ -97,6 +99,10 @@ test("dream agent: blocked shell commands", () => {
     `find / -exec sh {} ;`,
     `touch /tmp/x`,
     `rm -rf ${STORE}`,
+    `rm ${STORE}/work/projects/a/x.md`,
+    `unlink work/projects/a/x.md`,
+    `git -C /Users/u/work/app rev-list --count HEAD --output=/tmp/x`,
+    `git -C /Users/u/work/app grep -n x origin/master`,
     `curl https://example.com`,
   ]) assert.ok(!dream("shell", cmd), `should block: ${cmd}`);
 });

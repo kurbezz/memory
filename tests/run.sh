@@ -1905,6 +1905,73 @@ test_dream_run_failure_leaves_changes_uncommitted() {
   assert_not_contains "$(<"$DP1/INDEX.md")" "merged-fact"
 }
 
+test_dream_prompt_explains_deletion_and_git_commands() {
+  dream_fixture
+  local out store
+  store="$(cd -P "$AGENT_MEMORY_HOME" && pwd -P)"
+  out="$("$MEMORY" dream --print-config)"
+  assert_contains "$out" "only with \`git -C $store rm <path>\`"
+  assert_contains "$out" "\`rev-list\`"
+  assert_contains "$out" "There is no \`git grep\`"
+}
+
+test_dream_first_run_is_full_then_incremental() {
+  dream_launch_fixture
+  local out
+  # No previous run: the whole store is in scope.
+  out="$("$MEMORY" dream --print-config)"
+  assert_not_contains "$out" "Incremental run"
+  "$MEMORY" dream >/dev/null
+  assert_not_contains "$(<"$STUB_LOG/args")" "Incremental run"
+  # Nothing changed since: only hygiene.
+  out="$("$MEMORY" dream --print-config)"
+  assert_contains "$out" "Incremental run"
+  assert_contains "$out" "No fact changed since then"
+  # Changed, new (uncommitted) and deleted facts; INDEX.md does not count.
+  dfact "$DP1" fresh-one convention "a fresh convention" 2026-09-30
+  dfact "$DW" fresh-two gotcha "a fresh gotcha" 2026-09-30
+  git -C "$AGENT_MEMORY_HOME" rm -q work/projects/some-api/stale-fact.md
+  "$MEMORY" backup >/dev/null
+  dfact "$DP1" untracked-one decision "an untracked decision" 2026-09-30
+  out="$("$MEMORY" dream --print-config)"
+  assert_contains "$out" "Only these 3 facts were added or changed since then:"
+  assert_contains "$out" "- work/projects/some-api/fresh-one.md"
+  assert_contains "$out" "- work/projects/some-api/untracked-one.md"
+  assert_contains "$out" "- work/workspace/fresh-two.md"
+  assert_not_contains "$out" "stale-fact.md"
+  assert_not_contains "$out" "INDEX.md
+"
+  # --full ignores the marker.
+  out="$("$MEMORY" dream --print-config --full)"
+  assert_not_contains "$out" "Incremental run"
+  "$MEMORY" dream --full >/dev/null
+  assert_not_contains "$(<"$STUB_LOG/args")" "Incremental run"
+}
+
+test_dream_incremental_is_per_workspace() {
+  dream_launch_fixture
+  local out
+  "$MEMORY" dream >/dev/null
+  # A workspace run has its own marker, so the first one is full.
+  out="$("$MEMORY" dream --print-config --workspace work)"
+  assert_not_contains "$out" "Incremental run"
+  "$MEMORY" dream --workspace work >/dev/null
+  mkdir -p "$AGENT_MEMORY_HOME/home/workspace"
+  dfact "$AGENT_MEMORY_HOME/home/workspace" other-ws convention "another workspace" 2026-09-30
+  out="$("$MEMORY" dream --print-config --workspace work)"
+  assert_contains "$out" "No fact changed since then"
+  out="$("$MEMORY" dream --print-config)"
+  assert_contains "$out" "- home/workspace/other-ws.md"
+}
+
+test_dream_rejects_full_with_report() {
+  dream_fixture
+  local out rc=0
+  out="$("$MEMORY" dream --report --full 2>&1)" || rc=$?
+  assert_eq "$rc" 1
+  assert_contains "$out" "usage: memory dream"
+}
+
 # ---------------- runner ----------------
 
 for t in $(declare -F | awk '{print $3}' | grep '^test_'); do run_test "$t"; done

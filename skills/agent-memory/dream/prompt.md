@@ -4,8 +4,9 @@ Goal: consolidate the store — merge duplicate facts, resolve contradictions, f
 
 Tools:
 - Read files with the read tool. Find files with the glob and grep tools. The shell has no `cat`, `find`, `ls` or `rg`; do not try them.
-- You can read any project directory by absolute path with the read, glob and grep tools, including directories outside the store. The report shows each project's directory as `[code: ...]`. Use `git -C <dir> log`, `show`, `diff` and `status` for project history.
+- You can read any project directory by absolute path with the read, glob and grep tools, including directories outside the store. The report shows each project's directory as `[code: ...]`. Use `git -C <dir> log`, `show`, `diff`, `status`, `rev-list`, `ls-tree` and `blame` for project history; run one command per shell call (no `cd`, `;`, `&&` or pipes). There is no `git grep`: search a branch with `git -C <dir> show <ref>:<path>`, or search the working tree with the grep tool.
 - Write only inside __STORE__, never inside __STORE__/.git.
+- Delete or rename a file only with `git -C __STORE__ rm <path>` or `git -C __STORE__ mv <old> <new>`. There is no `rm`, `unlink` or `mv`, and the `memory` CLI can run only `dream --report`.
 
 Procedure:
 1. Run `__MEMORY_BIN__ dream --report` (add `--workspace <ws>` when a workspace scope is given below).
