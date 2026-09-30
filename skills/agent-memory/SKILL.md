@@ -23,7 +23,9 @@ The CLI ships with this skill: `bin/memory` next to this file. Use `memory`
 from PATH if installed; otherwise call the bundled script by its path
 (`<this skill's directory>/bin/memory`). It handles mechanics only — setting
 up `.memory/` (`init`), linking groups (`link-group`/`unlink-group`),
-consistency checks (`doctor`), OpenCode plugin installation
+consistency checks (`doctor`), memory consolidation (`dream --report` is a
+read-only whole-store report of duplicates, stale facts and drift; `dream`
+runs the cleanup unattended), OpenCode plugin installation
 (`install-opencode`), and store backup (`backup`). `backup` commits with a
 structured message derived from the staged diff (e.g.
 `memory(<project>): add <slug>, ...` or `memory: add N in S scopes` with a
@@ -127,6 +129,7 @@ between indexes and files, and warns about over-long descriptions and
 ### Housekeeping
 
 When an index grows past ~40 lines, or you notice near-duplicate or stale
-entries while reading it, merge, shorten, or delete before adding more. Task
-status ("still needs staging validation") does not belong in memory — record
-the decision or gotcha it produced, or nothing.
+entries, use the `memory-dream` skill for this project, or suggest
+`memory dream` (whole store, unattended) to the user. Task status ("still needs
+staging validation") does not belong in memory — record the decision or gotcha
+it produced, or nothing.

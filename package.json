@@ -6,6 +6,6 @@
     "node": ">=22"
   },
   "scripts": {
-    "test:opencode": "node --test tests/opencode-plugin.test.js"
+    "test:opencode": "node --test tests/opencode-plugin.test.js tests/dream-sandbox.test.js"
   }
 }

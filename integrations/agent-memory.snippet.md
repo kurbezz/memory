@@ -25,6 +25,8 @@ agent-memory skill). Rules:
 
   Then run `memory index` (or add `- [slug](slug.md) — type: description`
   to that level's `INDEX.md`).
+- To tidy memory (duplicates, stale facts) run `memory dream --report`, or
+  `memory dream` to consolidate the whole store unattended.
 - You never run `memory init` or `memory link-group` yourself — suggest them
   to the user. Full protocol: `skills/agent-memory/SKILL.md` in the
   agent-memory repository.

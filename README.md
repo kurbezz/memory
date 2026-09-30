@@ -30,8 +30,10 @@ npx skills add kurbezz/memory -g -a opencode
 ~/.agents/skills/agent-memory/bin/memory install-opencode
 ```
 
-The skill is self-contained: the `memory` CLI and the OpenCode plugin ship
-inside it. To call the CLI as plain `memory` (as in the examples below), put it
+`npx skills add` installs every skill in this repository: `agent-memory`
+(protocol, CLI, OpenCode plugin) and `memory-dream` (interactive cleanup of the
+current project's memory, see [Dream](#dream)). The `agent-memory` skill is
+self-contained: the `memory` CLI and the OpenCode plugin ship inside it. To call the CLI as plain `memory` (as in the examples below), put it
 on your `PATH`:
 
 ```bash
@@ -60,6 +62,8 @@ memory index                  # rebuild INDEX.md files from fact frontmatter
 memory status                 # levels, fact counts, groups you could link, backup state
 memory grep pgbouncer         # search facts (rg/grep -r do not see .memory/)
 memory doctor                 # check symlinks / indexes / frontmatter
+memory dream --report         # read-only report: duplicates, stale facts, drift
+memory dream                  # tidy the whole store with a sandboxed OpenCode run
 memory backup                 # commit the store; --push to push
 ```
 
@@ -74,6 +78,45 @@ memory backup                 # commit the store; --push to push
 
 The store location defaults to `~/.agent-memory` and can be overridden with
 `AGENT_MEMORY_HOME`.
+
+## Dream
+
+Memory rots: facts get duplicated, contradict each other or go stale. Dream
+consolidates the store — merge duplicates, resolve contradictions, verify and
+prune stale facts, move facts shared by several projects up to a group or the
+workspace.
+
+- `memory dream --report [--stale-days N] [--workspace <ws>]` — read-only
+  report over the whole store (works from any directory, writes nothing).
+- `memory dream [--workspace <ws>] [--model <provider/model>]` — an unattended
+  OpenCode agent works through the report and fixes the store.
+  `--print-config` shows the exact config and prompt without running anything.
+  Without `--model` it uses `AGENT_MEMORY_DREAM_MODEL`, or OpenCode's default
+  model. The consolidation is judgment work, so a strong model is worth it: in
+  testing, a small model read 35 of 500 facts and changed only descriptions.
+- The `memory-dream` skill does the same interactively for the current project,
+  asking for approval before deleting, merging or moving facts.
+
+The unattended run is sandboxed. The agent can read anywhere except secret
+paths (`~/.ssh`, `~/.aws`, `.env` files, ...), write only inside the store
+(never `.git`), and run only `memory dream --report`, read-only git commands
+(`log`, `show`, `diff`, `status`) and `git add/mv/rm` in the store. There is no
+`cat`/`rg` in the shell: file reading goes through OpenCode's own read tools,
+where the secret-path rules apply. Web access is allowed for checking references,
+and the only subagent is a read-only checker. The boundary is enforced through
+OpenCode `experimental.policies`, which a project's `opencode.json` cannot
+override. It runs `opencode run --standalone` from the store directory with the
+config passed in `OPENCODE_CONFIG_CONTENT`, so your OpenCode config files are
+not modified. Your global config and plugins still load, and the sandbox
+config is merged on top of them. `memory dream --print-config` shows the exact
+rules.
+
+The store is committed before the run (if it has pending changes) and after it;
+nothing is ever pushed. To undo a run:
+
+```bash
+git -C ~/.agent-memory revert HEAD
+```
 
 ## Other agents
 

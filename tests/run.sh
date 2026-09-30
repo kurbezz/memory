@@ -1302,6 +1302,514 @@ test_install_opencode_refuses_regular_file() {
   assert_eq "$(<"$HOME/.config/opencode/plugins/agent-memory.js")" "keep me"
 }
 
+# ---------------- dream ----------------
+
+assert_not_contains() { case "$1" in *"$2"*) fail "unexpected '$2' in: $1" ;; *) ;; esac; }
+
+dfact() {   # dfact <level-dir> <slug> <type> <description> <created> [updated]  (no INDEX line)
+  {
+    printf -- '---\ndescription: %s\ntype: %s\ncreated: %s\n' "$4" "$3" "$5"
+    if [ -n "${6:-}" ]; then printf 'updated: %s\n' "$6"; fi
+    printf -- '---\nbody of %s\n' "$2"
+  } > "$1/$2.md"
+}
+
+# Workspace "work" with projects some-api ($PROJ) and other-api; indexes built.
+dream_fixture() {
+  export AGENT_MEMORY_TODAY=2026-09-30
+  DS="$AGENT_MEMORY_HOME/work"
+  DP1="$DS/projects/some-api"
+  DP2="$DS/projects/other-api"
+  DW="$DS/workspace"
+  "$MEMORY" init work >/dev/null
+  mkdir -p "$TMP/code/other-api"
+  (cd "$TMP/code/other-api" && "$MEMORY" init work >/dev/null)
+}
+
+dream_reindex() {
+  "$MEMORY" index >/dev/null
+  (cd "$TMP/code/other-api" && "$MEMORY" index >/dev/null)
+}
+
+test_skill_memory_dream_frontmatter() {
+  local f="$ROOT/skills/memory-dream/SKILL.md"
+  assert_file "$f"
+  assert_eq "$(head -1 "$f")" "---"
+  grep -q '^name: memory-dream$' "$f" || fail "memory-dream skill has no name: memory-dream"
+  grep -q '^description: .' "$f" || fail "memory-dream skill has no description"
+  grep -q '^license: MIT$' "$f" || fail "memory-dream skill has no license"
+}
+
+test_dream_report_tidy_store() {
+  dream_fixture
+  dfact "$DP1" pool-limit gotcha "pgbouncer pool breaks above fifty connections" 2026-09-04
+  dfact "$DW" editor-setup convention "vim keybindings everywhere" 2026-09-04
+  dream_reindex
+  local out
+  out="$("$MEMORY" dream --report)"
+  assert_eq "$out" "dream: memory is tidy — nothing to consolidate"
+}
+
+test_dream_report_runs_without_memory_dir() {
+  dream_fixture
+  dfact "$DP1" pool-limit gotcha "pgbouncer pool breaks above fifty connections" 2026-09-04
+  dream_reindex
+  mkdir -p "$TMP/elsewhere"
+  cd "$TMP/elsewhere"
+  [ ! -e .memory ] || fail "unexpected .memory in $TMP/elsewhere"
+  local out
+  out="$("$MEMORY" dream --report)"
+  assert_contains "$out" "dream:"
+}
+
+test_dream_report_similar_within_a_level() {
+  dream_fixture
+  dfact "$DP1" pgbouncer-pool-limit gotcha "pgbouncer connection pool breaks above 50 connections" 2026-09-04
+  dfact "$DP1" pgbouncer-pool-size gotcha "pgbouncer connection pool size limit fifty" 2026-09-04
+  dfact "$DP1" deploy-checklist convention "release steps for staging" 2026-09-04
+  dream_reindex
+  local out
+  out="$("$MEMORY" dream --report)"
+  assert_contains "$out" "similar facts (merge, or check for contradiction):"
+  assert_contains "$out" "  work/projects/some-api/pgbouncer-pool-limit.md [code: $(cd -P "$PROJ" && pwd -P)] <-> work/projects/some-api/pgbouncer-pool-size.md [code: $(cd -P "$PROJ" && pwd -P)] (shared: connection, limit, pgbouncer, pool)"
+  assert_contains "$out" "dream: 1 similar, 0 repeated across projects, 0 shadowed, 0 stale, 0 unusable"
+  assert_not_contains "$out" "deploy-checklist"
+}
+
+test_dream_report_unrelated_facts_are_not_paired() {
+  dream_fixture
+  dfact "$DP1" pool-limit gotcha "pgbouncer pool breaks above fifty connections" 2026-09-04
+  dfact "$DP1" release-steps convention "staging deploy needs manual approval" 2026-09-04
+  dfact "$DW" editor-setup convention "vim keybindings everywhere" 2026-09-04
+  dream_reindex
+  local out
+  out="$("$MEMORY" dream --report)"
+  assert_not_contains "$out" "similar facts"
+  assert_not_contains "$out" "<->"
+}
+
+# bash 3.2 leaked a descriptor per `< <(...)` in the per-fact loop and died
+# with SIGTRAP (exit 133) after ~250 facts; the real store has 500+.
+test_dream_report_survives_many_facts() {
+  dream_fixture
+  local i=0
+  while [ "$i" -lt 320 ]; do
+    i=$((i + 1))
+    printf -- '---\ndescription: note %s\ntype: context\ncreated: 2026-09-01\n---\nsee [[n%s]]\n' "q${i}x" "$((i + 1))" > "$DW/n$i.md"
+  done
+  local out rc=0
+  out="$("$MEMORY" dream --report 2>&1)" || rc=$?
+  assert_eq "$rc" 0
+  assert_contains "$out" "dangling link: work/workspace/n320.md -> [[n321]]"
+}
+
+test_dream_report_repeated_across_projects() {
+  dream_fixture
+  dfact "$DP1" retry-policy convention "clients retry three times with backoff" 2026-09-04
+  dfact "$DP2" retry-policy convention "always exponential delays for HTTP calls" 2026-09-04
+  dream_reindex
+  local out
+  out="$("$MEMORY" dream --report)"
+  assert_contains "$out" "repeated across projects (move shared part to a group or workspace):"
+  assert_contains "$out" "  work: retry-policy in projects/other-api, projects/some-api (same slug)"
+  assert_not_contains "$out" "same slug in several levels"
+  assert_not_contains "$out" "similar facts"
+  assert_contains "$out" "dream: 0 similar, 1 repeated across projects, 0 shadowed, 0 stale, 0 unusable"
+}
+
+test_dream_report_shadowing() {
+  dream_fixture
+  dfact "$DP1" editor-setup convention "vim keybindings" 2026-09-04
+  dfact "$DW" editor-setup convention "docker compose ports notes" 2026-09-04
+  dream_reindex
+  local out
+  out="$("$MEMORY" dream --report)"
+  assert_contains "$out" "same slug in several levels (shadowing):"
+  assert_contains "$out" "  work: editor-setup in projects/some-api, workspace"
+  assert_contains "$out" "1 shadowed"
+}
+
+test_dream_report_never_compares_across_workspaces() {
+  dream_fixture
+  mkdir -p "$TMP/code/home-proj"
+  (cd "$TMP/code/home-proj" && "$MEMORY" init home >/dev/null)
+  dfact "$DP1" pool-limit gotcha "pgbouncer pool breaks above fifty connections" 2026-09-04
+  dfact "$AGENT_MEMORY_HOME/home/workspace" pool-limit gotcha "pgbouncer pool breaks above fifty connections" 2026-09-04
+  dream_reindex
+  (cd "$TMP/code/home-proj" && "$MEMORY" index >/dev/null)
+  local out
+  out="$("$MEMORY" dream --report)"
+  assert_not_contains "$out" "<->"
+  assert_not_contains "$out" "pool-limit in"
+  assert_contains "$out" "dream: memory is tidy"
+}
+
+test_dream_report_workspace_filter() {
+  dream_fixture
+  mkdir -p "$TMP/code/home-proj"
+  (cd "$TMP/code/home-proj" && "$MEMORY" init home >/dev/null)
+  dfact "$DP1" pgbouncer-pool-limit gotcha "pgbouncer connection pool breaks above 50 connections" 2026-09-04
+  dfact "$DP1" pgbouncer-pool-size gotcha "pgbouncer connection pool size limit fifty" 2026-09-04
+  dfact "$AGENT_MEMORY_HOME/home/workspace" old-note context "very old note about laptop" 2025-01-01
+  dream_reindex
+  (cd "$TMP/code/home-proj" && "$MEMORY" index >/dev/null)
+  local out rc=0
+  out="$("$MEMORY" dream --report --workspace home)"
+  assert_contains "$out" "home/workspace/old-note.md"
+  assert_not_contains "$out" "pgbouncer"
+  out="$("$MEMORY" dream --report --workspace work)"
+  assert_contains "$out" "pgbouncer-pool-limit"
+  assert_not_contains "$out" "old-note"
+  out="$("$MEMORY" dream --report --workspace nope 2>&1)" || rc=$?
+  assert_eq "$rc" 1
+  assert_contains "$out" "no such workspace"
+  rc=0
+  out="$("$MEMORY" dream --report --workspace 'Bad_Name' 2>&1)" || rc=$?
+  assert_eq "$rc" 1
+  assert_contains "$out" "invalid workspace name"
+  rc=0
+  out="$("$MEMORY" dream --report --workspace 2>&1)" || rc=$?
+  assert_eq "$rc" 1
+  assert_contains "$out" "usage: memory dream"
+}
+
+test_dream_report_stale_facts() {
+  dream_fixture
+  dfact "$DP1" old-decision decision "chose the queue library long ago" 2026-01-01
+  dfact "$DP1" fresh-decision decision "picked the metrics backend" 2026-01-01 2026-09-01
+  dream_reindex
+  local out
+  out="$("$MEMORY" dream --report)"
+  assert_contains "$out" "stale facts (older than 180 days — verify, update 'updated:', or delete):"
+  assert_contains "$out" "  work/projects/some-api/old-decision.md [code: $(cd -P "$PROJ" && pwd -P)] — decision, 272d since 2026-01-01"
+  assert_not_contains "$out" "fresh-decision"
+  assert_contains "$out" "1 stale"
+  out="$("$MEMORY" dream --report --stale-days 300)"
+  assert_eq "$out" "dream: memory is tidy — nothing to consolidate"
+  out="$("$MEMORY" dream --report --stale-days 10)"
+  assert_contains "$out" "older than 10 days"
+  assert_contains "$out" "fresh-decision.md [code: $(cd -P "$PROJ" && pwd -P)] — decision, 29d since 2026-09-01"
+}
+
+test_dream_report_rejects_bad_arguments() {
+  dream_fixture
+  local out rc args
+  for args in "--report --stale-days 0" "--report --stale-days abc" "--report --stale-days -5" \
+              "--report --stale-days" "--report --stale-days 1.5" "--report --bogus" \
+              "--report --model x/y" "--stale-days 5" "--report extra"; do
+    rc=0
+    # shellcheck disable=SC2086 # Word splitting of the fixed argument lists is intended.
+    out="$("$MEMORY" dream $args 2>&1)" || rc=$?
+    assert_eq "$rc" 1
+    assert_contains "$out" "usage: memory dream"
+  done
+  rc=0
+  out="$(AGENT_MEMORY_TODAY=2026-02-30 "$MEMORY" dream --report 2>&1)" || rc=$?
+  assert_eq "$rc" 1
+  assert_contains "$out" "invalid AGENT_MEMORY_TODAY"
+}
+
+test_dream_report_lists_unusable_facts_without_failing() {
+  dream_fixture
+  printf 'no frontmatter here\n' > "$DP1/broken.md"
+  dfact "$DP1" good-fact convention "vim keybindings everywhere" 2026-09-04
+  dream_reindex
+  local out rc=0
+  out="$("$MEMORY" dream --report)" || rc=$?
+  assert_eq "$rc" 0
+  assert_contains "$out" "unusable facts (fix frontmatter):"
+  assert_contains "$out" "work/projects/some-api/broken.md"
+  assert_not_contains "$out" "good-fact"
+  assert_contains "$out" "1 unusable"
+}
+
+test_dream_report_orphan_project() {
+  dream_fixture
+  dfact "$DP2" some-fact convention "vim keybindings everywhere" 2026-09-04
+  (cd "$TMP/code/other-api" && "$MEMORY" index >/dev/null)
+  rm -rf "$TMP/code/other-api"
+  local out
+  out="$("$MEMORY" dream --report)"
+  assert_contains "$out" "hygiene:"
+  assert_contains "$out" "  orphan project: work/projects/other-api (recorded dir is gone)"
+  rm -f "$DP1/.project-path"
+  out="$("$MEMORY" dream --report)"
+  assert_contains "$out" "  orphan project: work/projects/some-api (.project-path missing)"
+}
+
+test_dream_report_hygiene_long_description_and_dangling_link() {
+  dream_fixture
+  local long
+  long="$(printf 'word%.0s ' $(seq 1 40))"
+  dfact "$DP1" long-one gotcha "$long" 2026-09-04
+  dfact "$DP1" linker convention "vim keybindings everywhere" 2026-09-04
+  printf 'see [[gone-fact]] and [[linker]]\n' >> "$DP1/linker.md"
+  dream_reindex
+  local out
+  out="$("$MEMORY" dream --report)"
+  assert_contains "$out" "long description ("
+  assert_contains "$out" "dangling link: work/projects/some-api/linker.md"
+  assert_contains "$out" "-> [[gone-fact]]"
+  assert_not_contains "$out" "[[linker]]"
+}
+
+test_dream_report_index_drift_and_large_index() {
+  dream_fixture
+  dfact "$DP1" pool-limit gotcha "pgbouncer pool breaks above fifty connections" 2026-09-04
+  dream_reindex
+  dfact "$DP1" unindexed-fact convention "vim keybindings everywhere" 2026-09-04
+  rm "$DW/INDEX.md"
+  fill_index "$DP2/INDEX.md" 41
+  local out
+  out="$("$MEMORY" dream --report)"
+  assert_contains "$out" "index drift (run 'memory dream' or 'memory index'):"
+  assert_contains "$out" "  work/projects/some-api/INDEX.md (differs from the facts)"
+  assert_contains "$out" "  work/workspace/INDEX.md (missing)"
+  assert_contains "$out" "large indexes (> 40 entries — merge or prune):"
+  assert_contains "$out" "  work/projects/other-api/INDEX.md (41 entries)"
+}
+
+test_dream_report_writes_nothing() {
+  dream_fixture
+  dfact "$DP1" pgbouncer-pool-limit gotcha "pgbouncer connection pool breaks above 50 connections" 2026-09-04
+  dfact "$DP1" pgbouncer-pool-size gotcha "pgbouncer connection pool size limit fifty" 2026-01-01
+  dfact "$DP2" retry-policy convention "clients retry three times with backoff" 2026-09-04
+  dfact "$DP1" retry-policy convention "always exponential delays for HTTP calls" 2026-09-04
+  printf 'broken\n' > "$DP1/broken.md"
+  dream_reindex
+  dfact "$DP1" unindexed convention "vim keybindings everywhere" 2026-09-04
+  local before after out
+  before="$(find "$AGENT_MEMORY_HOME" -type f -exec cksum {} + | LC_ALL=C sort)"
+  out="$("$MEMORY" dream --report)"
+  assert_contains "$out" "dream:"
+  after="$(find "$AGENT_MEMORY_HOME" -type f -exec cksum {} + | LC_ALL=C sort)"
+  assert_eq "$after" "$before"
+}
+
+test_dream_report_output_is_deterministic() {
+  dream_fixture
+  dfact "$DP1" pgbouncer-pool-limit gotcha "pgbouncer connection pool breaks above 50 connections" 2026-09-04
+  dfact "$DP1" pgbouncer-pool-size gotcha "pgbouncer connection pool size limit fifty" 2026-01-01
+  dfact "$DP2" retry-policy convention "clients retry three times with backoff" 2026-01-02
+  dfact "$DP1" retry-policy convention "always exponential delays for HTTP calls" 2026-01-03
+  dream_reindex
+  local a b
+  a="$("$MEMORY" dream --report)"
+  b="$(LC_ALL=en_US.UTF-8 "$MEMORY" dream --report)"
+  assert_eq "$b" "$a"
+}
+
+test_dream_report_handles_non_ascii_descriptions() {
+  dream_fixture
+  dfact "$DP1" uvicorn-workers-first gotcha "воркеры uvicorn падают при перезапуске" 2026-09-04
+  dfact "$DP1" uvicorn-workers-second gotcha "воркеры uvicorn падают при перезапуске сервера" 2026-09-04
+  dream_reindex
+  local out
+  out="$("$MEMORY" dream --report)"
+  assert_contains "$out" "uvicorn-workers-first.md [code: $(cd -P "$PROJ" && pwd -P)] <-> work/projects/some-api/uvicorn-workers-second.md"
+  assert_contains "$out" "воркеры"
+}
+
+# ---- dream launcher (fake opencode) ----
+
+install_opencode_stub() {
+  STUB_LOG="$TMP/stub"
+  export STUB_LOG
+  mkdir -p "$TMP/bin" "$STUB_LOG"
+  cat > "$TMP/bin/opencode" <<'EOF'
+#!/usr/bin/env bash
+pwd -P > "$STUB_LOG/pwd"
+printf '%s\n' "$@" > "$STUB_LOG/args"
+printf '%s' "${OPENCODE_CONFIG_CONTENT:-}" > "$STUB_LOG/config"
+git status --porcelain --untracked-files=all > "$STUB_LOG/status-at-run"
+git log --oneline | wc -l | tr -d ' ' > "$STUB_LOG/commits-at-run"
+if [ -n "${STUB_EDIT:-}" ]; then
+  rm -f work/projects/some-api/stale-fact.md
+  printf -- '---\ndescription: merged replacement\ntype: decision\ncreated: 2026-09-04\n---\nbody\n' \
+    > work/projects/some-api/merged-fact.md
+fi
+exit "${STUB_EXIT:-0}"
+EOF
+  chmod +x "$TMP/bin/opencode"
+  PATH="$TMP/bin:$PATH"
+}
+
+# Fixture store with a committed baseline that contains stale-fact.
+dream_launch_fixture() {
+  dream_fixture
+  dfact "$DP1" stale-fact decision "an outdated decision" 2026-09-04
+  dream_reindex
+  "$MEMORY" backup >/dev/null
+  install_opencode_stub
+}
+
+commit_count() { git -C "$AGENT_MEMORY_HOME" log --oneline | wc -l | tr -d ' '; }
+
+test_dream_print_config_renders_without_launching() {
+  dream_fixture
+  local out store
+  store="$(cd -P "$AGENT_MEMORY_HOME" && pwd -P)"
+  # No opencode on PATH: --print-config must not need it.
+  out="$(PATH="/usr/bin:/bin" "$MEMORY" dream --print-config)"
+  assert_not_contains "$out" "__"
+  assert_contains "$out" "$store"
+  assert_contains "$out" "experimental"
+  assert_contains "$out" "memory-dream-check"
+  assert_contains "$out" "$HOME/.ssh/*"
+  assert_contains "$out" "$store/.git/*"
+  assert_contains "$out" "$ROOT/skills/agent-memory/bin/memory dream --report"
+  assert_contains "$out" "---"
+  assert_not_contains "$out" "Workspace scope:"
+  out="$("$MEMORY" dream --print-config --workspace work)"
+  assert_contains "$out" "Workspace scope: work"
+}
+
+test_dream_print_config_is_valid_json() {
+  command -v node >/dev/null 2>&1 || { echo "  (skipped: node not found)"; return 0; }
+  dream_fixture
+  local json
+  json="$("$MEMORY" dream --print-config | awk '$0 == "---" { exit } { print }')"
+  [ -n "$json" ] || fail "no config part before ---"
+  printf '%s' "$json" | node -e '
+    const c = JSON.parse(require("fs").readFileSync(0, "utf8"));
+    if (c.default_agent !== "memory-dream") throw new Error("default_agent");
+    if (!Array.isArray(c.experimental.policies) || c.experimental.policies[0].effect !== "deny") throw new Error("policies");
+    if (c.agents["memory-dream"].mode !== "primary") throw new Error("primary");
+    if (c.agents["memory-dream-check"].mode !== "subagent") throw new Error("subagent");
+    const check = c.agents["memory-dream-check"].permissions;
+    if (check.some((p) => p.action === "edit" && p.effect === "allow")) throw new Error("check agent can edit");
+    if (check.some((p) => p.action === "subagent" && p.effect === "allow")) throw new Error("check agent can spawn");
+    if (JSON.stringify(c).includes("\"ask\"")) throw new Error("ask effect used");
+  ' || fail "print-config JSON invalid or wrong shape"
+}
+
+test_dream_rejects_json_unsafe_home() {
+  dream_fixture
+  local out rc=0
+  mkdir -p "$TMP/ho\"me"
+  out="$(HOME="$TMP/ho\"me" "$MEMORY" dream --print-config 2>&1)" || rc=$?
+  assert_eq "$rc" 1
+  assert_contains "$out" "cannot run dream"
+}
+
+test_dream_requires_opencode_on_path() {
+  dream_fixture
+  local out rc=0
+  if PATH="/usr/bin:/bin" command -v opencode >/dev/null 2>&1; then
+    echo "  (skipped: opencode installed in a system directory)"; return 0
+  fi
+  out="$(PATH="/usr/bin:/bin" "$MEMORY" dream 2>&1)" || rc=$?
+  assert_eq "$rc" 1
+  assert_contains "$out" "opencode not found on PATH"
+}
+
+test_dream_requires_git_store() {
+  local out rc=0
+  out="$("$MEMORY" dream --print-config 2>&1)" || rc=$?
+  assert_eq "$rc" 1
+  assert_contains "$out" "no store"
+  mkdir -p "$AGENT_MEMORY_HOME/work"
+  rc=0
+  out="$("$MEMORY" dream --print-config 2>&1)" || rc=$?
+  assert_eq "$rc" 1
+  assert_contains "$out" "not a git repository"
+}
+
+test_dream_print_config_writes_nothing() {
+  dream_launch_fixture
+  local before after
+  before="$(find "$AGENT_MEMORY_HOME" -type f -exec cksum {} + | LC_ALL=C sort)"
+  dfact "$DP1" pending convention "uncommitted fact" 2026-09-04
+  before="$before
+$(cksum "$DP1/pending.md")"
+  before="$(printf '%s\n' "$before" | LC_ALL=C sort)"
+  "$MEMORY" dream --print-config >/dev/null
+  after="$(find "$AGENT_MEMORY_HOME" -type f -exec cksum {} + | LC_ALL=C sort)"
+  assert_eq "$after" "$before"
+  [ ! -e "$STUB_LOG/args" ] || fail "print-config launched opencode"
+  [ -n "$(git -C "$AGENT_MEMORY_HOME" status --porcelain)" ] || fail "print-config committed the pending change"
+}
+
+test_dream_run_commits_pending_changes_first() {
+  dream_launch_fixture
+  dfact "$DP1" pending convention "uncommitted fact" 2026-09-04
+  local base
+  base="$(commit_count)"
+  "$MEMORY" dream >/dev/null
+  assert_eq "$(<"$STUB_LOG/status-at-run")" ""
+  assert_eq "$(<"$STUB_LOG/commits-at-run")" "$((base + 1))"
+}
+
+test_dream_run_launches_from_store_with_agent_and_config() {
+  dream_launch_fixture
+  "$MEMORY" dream >/dev/null
+  assert_eq "$(<"$STUB_LOG/pwd")" "$(cd -P "$AGENT_MEMORY_HOME" && pwd -P)"
+  assert_eq "$(head -4 "$STUB_LOG/args" | tr '\n' ' ')" "run --standalone --agent memory-dream "
+  assert_contains "$(<"$STUB_LOG/args")" "You run unattended over the memory store at $(cd -P "$AGENT_MEMORY_HOME" && pwd -P)"
+  assert_contains "$(<"$STUB_LOG/config")" "\"default_agent\": \"memory-dream\""
+  assert_not_contains "$(<"$STUB_LOG/config")" "__STORE__"
+  assert_not_contains "$(<"$STUB_LOG/args")" "--model"
+}
+
+test_dream_run_passes_model_and_workspace() {
+  dream_launch_fixture
+  "$MEMORY" dream --model example/model-1 --workspace work >/dev/null
+  assert_contains "$(<"$STUB_LOG/args")" "--model
+example/model-1"
+  assert_contains "$(<"$STUB_LOG/args")" "Workspace scope: work"
+}
+
+test_dream_run_model_from_env_and_flag_override() {
+  dream_launch_fixture
+  AGENT_MEMORY_DREAM_MODEL=example/from-env "$MEMORY" dream >/dev/null
+  assert_contains "$(<"$STUB_LOG/args")" "--model
+example/from-env"
+  AGENT_MEMORY_DREAM_MODEL=example/from-env "$MEMORY" dream --model example/flag >/dev/null
+  assert_contains "$(<"$STUB_LOG/args")" "--model
+example/flag"
+  assert_not_contains "$(<"$STUB_LOG/args")" "from-env"
+  # The env default must not make --report reject its arguments.
+  AGENT_MEMORY_DREAM_MODEL=example/from-env "$MEMORY" dream --report >/dev/null
+}
+
+test_dream_run_rebuilds_indexes_and_commits() {
+  dream_launch_fixture
+  local base out
+  base="$(commit_count)"
+  out="$(STUB_EDIT=1 "$MEMORY" dream)"
+  assert_eq "$(commit_count)" "$((base + 1))"
+  assert_contains "$(<"$DP1/INDEX.md")" "[merged-fact](merged-fact.md) — decision: merged replacement"
+  assert_not_contains "$(<"$DP1/INDEX.md")" "stale-fact"
+  assert_eq "$(git -C "$AGENT_MEMORY_HOME" status --porcelain)" ""
+  assert_contains "$out" "dream: changes since"
+  assert_contains "$out" "merged-fact.md"
+  assert_contains "$out" "stale-fact.md"
+  "$MEMORY" doctor >/dev/null
+  [ -z "$(git -C "$AGENT_MEMORY_HOME" remote)" ] || fail "store unexpectedly has a remote"
+}
+
+test_dream_run_without_changes_reports_none() {
+  dream_launch_fixture
+  local base out
+  base="$(commit_count)"
+  out="$("$MEMORY" dream)"
+  assert_eq "$(commit_count)" "$base"
+  assert_contains "$out" "dream: no changes"
+}
+
+test_dream_run_failure_leaves_changes_uncommitted() {
+  dream_launch_fixture
+  local head out rc=0
+  head="$(git -C "$AGENT_MEMORY_HOME" rev-parse HEAD)"
+  out="$(STUB_EDIT=1 STUB_EXIT=1 "$MEMORY" dream 2>&1)" || rc=$?
+  assert_eq "$rc" 1
+  assert_contains "$out" "opencode run failed (exit 1)"
+  assert_contains "$out" "left uncommitted"
+  assert_eq "$(git -C "$AGENT_MEMORY_HOME" rev-parse HEAD)" "$head"
+  [ -n "$(git -C "$AGENT_MEMORY_HOME" status --porcelain)" ] || fail "failed run left no changes to review"
+  assert_not_contains "$(<"$DP1/INDEX.md")" "merged-fact"
+}
+
 # ---------------- runner ----------------
 
 for t in $(declare -F | awk '{print $3}' | grep '^test_'); do run_test "$t"; done

@@ -9,6 +9,11 @@ INDEX_ENTRY_RE='^- \[[a-z0-9][a-z0-9-]*\]\([a-z0-9][a-z0-9-]*\.md\) (—|–|-) 
 export INDEX_ENTRY_RE
 INDEX_TEMP_FILES=()
 
+# Small English words dropped from `memory dream`'s similarity tokenizer; they
+# carry no topical signal and would otherwise inflate overlap scores.
+DREAM_STOPWORDS='the and for with that this from are was not use uses used when into only via per its has have all any but can must should does never always'
+export DREAM_STOPWORDS
+
 # Make a relative store location independent of later directory changes.  The
 # store itself is canonicalized by init before it is used as a link target.
 MEMORY_HOME="${AGENT_MEMORY_HOME:-$HOME/.agent-memory}"
@@ -29,6 +34,8 @@ commands:
   status                                    levels, fact counts, unlinked groups, backup state
   grep <pattern> [grep opts]                search all linked levels (follows the symlinks)
   doctor                                    check symlinks, indexes, frontmatter
+  dream --report [--stale-days N] [--workspace <ws>]  read-only whole-store report: duplicates, stale facts
+  dream [--workspace <ws>] [--model <m>] [--print-config]  tidy the whole store with a sandboxed OpenCode run
   backup [--push]                           commit (and push) the store
   install-opencode                          install the global OpenCode plugin
 EOF
@@ -284,6 +291,26 @@ valid_calendar_date() {
   [ "$d" -ge 1 ] && [ "$d" -le "$max" ]
 }
 
+# Days-from-civil (Howard Hinnant's algorithm): a monotonic day number for a
+# YYYY-MM-DD date, computed with pure integer arithmetic so age comparisons
+# never depend on a platform-specific `date -d`. Assumes the caller already
+# validated the date.
+days_from_civil() {
+  local date="$1" year month day y m d era yoe mp doy doe
+  year="${date%%-*}"
+  local rest="${date#*-}"
+  month="${rest%%-*}"
+  day="${rest#*-}"
+  y=$((10#$year)); m=$((10#$month)); d=$((10#$day))
+  [ "$m" -le 2 ] && y=$((y - 1))
+  if [ "$y" -ge 0 ]; then era=$((y / 400)); else era=$(((y - 399) / 400)); fi
+  yoe=$((y - era * 400))
+  mp=$(((m + 9) % 12))
+  doy=$(((153 * mp + 2) / 5 + d - 1))
+  doe=$((yoe * 365 + yoe / 4 - yoe / 100 + doy))
+  echo $((era * 146097 + doe - 719468))
+}
+
 check_frontmatter() {
   local f="$1" front created updated description_count type_count created_count updated_count status
   IFS= read -r front < "$f" || true
@@ -394,6 +421,7 @@ render_index() {
   done
 }
 
+# shellcheck disable=SC2329 # invoked from the traps in publish_indexes
 cleanup_index_temps() {
   local temp
   [ "${#INDEX_TEMP_FILES[@]}" -gt 0 ] || return 0
@@ -402,13 +430,47 @@ cleanup_index_temps() {
   done
 }
 
+# Rebuilds INDEX.md for PUBLISH_LEVELS (labels in PUBLISH_LABELS): every index
+# is rendered into a temporary file inside its level first, and only when all
+# renders succeeded are they moved into place.
+publish_indexes() {
+  local i level temp n
+  local -a temps=()
+  INDEX_TEMP_FILES=()
+  trap 'cleanup_index_temps' EXIT
+  trap 'cleanup_index_temps; exit 1' HUP INT TERM
+  i=0
+  while [ "$i" -lt "${#PUBLISH_LEVELS[@]}" ]; do
+    level="${PUBLISH_LEVELS[$i]}"
+    temp="$(mktemp "$level/.memory-index.XXXXXX")" || die "cannot create temporary index in $level"
+    INDEX_TEMP_FILES+=("$temp")
+    if ! render_index "$level" "${PUBLISH_LABELS[$i]}" > "$temp"; then
+      die "failed to render index for ${PUBLISH_LABELS[$i]}"
+    fi
+    temps+=("$temp")
+    i=$((i + 1))
+  done
+  i=0
+  while [ "$i" -lt "${#PUBLISH_LEVELS[@]}" ]; do
+    level="${PUBLISH_LEVELS[$i]}"
+    if ! mv "${temps[$i]}" "$level/INDEX.md"; then
+      die "failed to publish index for ${PUBLISH_LABELS[$i]}"
+    fi
+    n="$(grep -c '^- \[' "$level/INDEX.md" || true)"
+    echo "indexed ${PUBLISH_LABELS[$i]} ($n facts)"
+    i=$((i + 1))
+  done
+  INDEX_TEMP_FILES=()
+  trap - EXIT HUP INT TERM
+}
+
 cmd_index() {
   [ $# -eq 0 ] || die "usage: memory index"
   [ -d .memory ] || die "no .memory/ here (run 'memory init <workspace>' first)"
   [ -d "$MEMORY_HOME" ] || die "no store at $MEMORY_HOME (run 'memory init' first)"
   STORE_HOME="$(cd -P "$MEMORY_HOME" && pwd -P)"
-  local link target level temp n i
-  local -a levels=() labels=() temps=()
+  local link target level i
+  local -a levels=() labels=()
   if { [ ! -e .memory/project ] && [ ! -L .memory/project ]; } && \
      { [ ! -e .memory/workspace ] && [ ! -L .memory/workspace ]; }; then
     die "no usable linked levels"
@@ -435,32 +497,9 @@ cmd_index() {
     i=$((i + 1))
   done
 
-  INDEX_TEMP_FILES=()
-  trap 'cleanup_index_temps' EXIT
-  trap 'cleanup_index_temps; exit 1' HUP INT TERM
-  i=0
-  while [ "$i" -lt "${#levels[@]}" ]; do
-    level="${levels[$i]}"
-    temp="$(mktemp "$level/.memory-index.XXXXXX")" || die "cannot create temporary index in $level"
-    INDEX_TEMP_FILES+=("$temp")
-    if ! render_index "$level" "${labels[$i]}" > "$temp"; then
-      die "failed to render index for ${labels[$i]}"
-    fi
-    temps+=("$temp")
-    i=$((i + 1))
-  done
-  i=0
-  while [ "$i" -lt "${#levels[@]}" ]; do
-    level="${levels[$i]}"
-    if ! mv "${temps[$i]}" "$level/INDEX.md"; then
-      die "failed to publish index for ${labels[$i]}"
-    fi
-    n="$(grep -c '^- \[' "$level/INDEX.md" || true)"
-    echo "indexed ${labels[$i]} ($n facts)"
-    i=$((i + 1))
-  done
-  INDEX_TEMP_FILES=()
-  trap - EXIT HUP INT TERM
+  PUBLISH_LEVELS=("${levels[@]}")
+  PUBLISH_LABELS=("${labels[@]}")
+  publish_indexes
 }
 
 doctor_project_hints() {
@@ -598,6 +637,413 @@ cmd_doctor() {
   [ -z "$warnings" ] || { echo "warnings (not failures):"; printf '%s\n' "$warnings"; }
   if [ -n "$problems" ]; then printf '%s\n' "$problems"; die "problems found"; fi
   echo "OK"
+}
+
+# ---------------------------------------------------------------------------
+# memory dream
+#
+# `memory dream --report` is a read-only analysis of the whole store;
+# `memory dream` hands that report to a sandboxed OpenCode agent that
+# consolidates the store (merge duplicates, resolve contradictions, prune
+# stale facts) and then rebuilds the indexes and commits.
+# ---------------------------------------------------------------------------
+
+# Every level of the store, optionally only one workspace: <ws>/workspace,
+# <ws>/groups/<g>, <ws>/projects/<p>. Fills DREAM_LEVELS (canonical paths) and
+# DREAM_RELS (store-relative names). Dot entries, invalid names and anything
+# whose canonical path leaves the store are skipped.
+dream_collect_levels() {
+  DREAM_LEVELS=()
+  DREAM_RELS=()
+  local only="${1:-}" ws wsname d canon
+  for ws in "$STORE_HOME"/*/; do
+    [ -d "$ws" ] || continue
+    ws="${ws%/}"
+    wsname="${ws##*/}"
+    valid_slug "$wsname" || continue
+    [ -z "$only" ] || [ "$only" = "$wsname" ] || continue
+    for d in "$ws/workspace" "$ws"/groups/*/ "$ws"/projects/*/; do
+      d="${d%/}"
+      [ -d "$d" ] || continue
+      valid_slug "${d##*/}" || continue
+      canon="$(cd -P "$d" 2>/dev/null && pwd -P)" || continue
+      is_in_store "$canon" || continue
+      DREAM_LEVELS+=("$canon")
+      DREAM_RELS+=("${d#"$STORE_HOME"/}")
+    done
+  done
+}
+
+# Similarity, repeated-across-projects and shadowing analysis. Reads sorted
+# rows  rel<TAB>ws<TAB>slug<TAB>type<TAB>description<TAB>date<TAB>code  and
+# prints tagged lines: "S<TAB>line" (similar), "R<TAB>line" (repeated across
+# projects), "H<TAB>line" (same slug in several levels).
+#
+# Tokens are the slug's words plus the description, lowercased. Anything that
+# is not [a-z0-9] or a byte >= 0x80 separates words (so non-ASCII words stay
+# whole); words under 3 characters and DREAM_STOPWORDS are dropped and
+# duplicates collapse. A pair is reported when it shares >= 2 words and
+# |shared| / min(|A|,|B|) >= 0.6. Facts of different workspaces are never
+# compared.
+dream_pairs() {
+  LC_ALL=C awk -F'\t' '
+    BEGIN {
+      n = split(ENVIRON["DREAM_STOPWORDS"], stopArr, " ")
+      for (i = 1; i <= n; i++) STOP[stopArr[i]] = 1
+    }
+    function tokenize(id, text,   s, arr, nn, i, w, nw, seen) {
+      s = tolower(text)
+      gsub(/[^a-z0-9\200-\377]+/, " ", s)
+      nn = split(s, arr, " ")
+      nw = 0
+      for (i = 1; i <= nn; i++) {
+        w = arr[i]
+        if (length(w) < 3) continue
+        if (w in STOP) continue
+        if (w in seen) continue
+        seen[w] = 1
+        WORD[id, ++nw] = w
+      }
+      return nw
+    }
+    function isproj(i,   parts) {
+      split(REL[i], parts, "/")
+      return parts[2] == "projects"
+    }
+    function path(i) {
+      return REL[i] "/" SLUG[i] ".md" (CODE[i] != "" ? " [code: " CODE[i] "]" : "")
+    }
+    {
+      N++
+      REL[N] = $1; WS[N] = $2; SLUG[N] = $3; CODE[N] = $7
+      NW[N] = tokenize(N, $3 " " $5)
+      key = $2 SUBSEP $3
+      lvl = substr($1, length($2) + 2)
+      if (!(key in SC)) { ALLP[key] = 1; SWS[key] = $2; SSLUG[key] = $3; SL[key] = lvl }
+      else SL[key] = SL[key] ", " lvl
+      SC[key]++
+      if (!isproj(N)) ALLP[key] = 0
+    }
+    END {
+      for (a = 1; a <= N; a++) {
+        for (b = a + 1; b <= N; b++) {
+          if (WS[b] != WS[a]) continue
+          shared = 0
+          delete SW
+          for (x = 1; x <= NW[a]; x++) {
+            wa = WORD[a, x]
+            for (y = 1; y <= NW[b]; y++) {
+              if (wa == WORD[b, y]) { if (!(wa in SW)) { SW[wa] = 1; shared++ }; break }
+            }
+          }
+          minlen = (NW[a] < NW[b]) ? NW[a] : NW[b]
+          similar = (shared >= 2 && minlen > 0 && (shared / minlen) >= 0.6)
+          repeated = (isproj(a) && isproj(b) && REL[a] != REL[b])
+          # Same slug in several projects is reported once per slug below.
+          if (repeated && SLUG[a] == SLUG[b]) continue
+          if (!similar) continue
+          list = ""
+          if (similar) {
+            ns = 0
+            for (k in SW) sw2[++ns] = k
+            for (ii = 2; ii <= ns; ii++) {
+              tmp = sw2[ii]; jj = ii - 1
+              while (jj >= 1 && sw2[jj] > tmp) { sw2[jj + 1] = sw2[jj]; jj-- }
+              sw2[jj + 1] = tmp
+            }
+            list = "shared: " sw2[1]
+            for (ii = 2; ii <= ns; ii++) list = list ", " sw2[ii]
+            delete sw2
+          }
+          print (repeated ? "R" : "S") "\t  " path(a) " <-> " path(b) " (" list ")"
+        }
+      }
+      for (key in SC) {
+        if (SC[key] < 2) continue
+        if (ALLP[key]) print "R\t  " SWS[key] ": " SSLUG[key] " in " SL[key] " (same slug)"
+        else print "H\t  " SWS[key] ": " SSLUG[key] " in " SL[key]
+      }
+    }
+  '
+}
+
+# Lines of one tag from dream_pairs output, tag stripped.
+dream_tag() {
+  awk -F'\t' -v t="$1" '$1 == t { print $2 }'
+}
+
+# Number of lines in $1 (0 when empty).
+dream_count() {
+  if [ -z "$1" ]; then echo 0; else printf '%s' "$1" | grep -c '' || true; fi
+}
+
+# One report section: header plus the sorted body; nothing when body is empty.
+dream_emit() {   # dream_emit <header> <body>
+  [ -n "$2" ] || return 0
+  echo "$1"
+  printf '%s\n' "$2" | LC_ALL=C sort
+}
+
+# Store-relative fact path, plus the recorded project directory (if any) so
+# the agent can verify the fact against code.
+dream_fact_path() {   # dream_fact_path <rel> <file> <code>
+  if [ -n "$3" ]; then printf '%s/%s [code: %s]' "$1" "$2" "$3"; else printf '%s/%s' "$1" "$2"; fi
+}
+
+# A [[slug]] resolves if any level of the workspace has slug.md.
+dream_wiki_exists() {   # dream_wiki_exists <ws> <slug>
+  local w="$STORE_HOME/$1" s="$2" f
+  for f in "$w/workspace/$s.md" "$w"/groups/*/"$s.md" "$w"/projects/*/"$s.md"; do
+    [ -f "$f" ] && return 0
+  done
+  return 1
+}
+
+# Why a project directory in the store is orphaned; empty when it is not.
+dream_orphan_reason() {   # dream_orphan_reason <level> <recorded-code-path>
+  local level="$1" code="$2" linked
+  if [ -z "$code" ]; then echo ".project-path missing"; return; fi
+  if [ ! -d "$code" ]; then echo "recorded dir is gone"; return; fi
+  linked="$(safe_link_target "$code/.memory/project" 2>/dev/null || true)"
+  [ "$linked" = "$level" ] || echo ".memory/project no longer links to this project dir"
+}
+
+dream_report() {   # dream_report <stale-days> [<workspace>]
+  local stale_days="$1" only="${2:-}" today today_days
+  if [ -n "${AGENT_MEMORY_TODAY:-}" ]; then
+    valid_calendar_date "$AGENT_MEMORY_TODAY" || die "invalid AGENT_MEMORY_TODAY: $AGENT_MEMORY_TODAY"
+    today="$AGENT_MEMORY_TODAY"
+  else
+    today="$(date +%Y-%m-%d)"
+  fi
+  today_days="$(days_from_civil "$today")"
+
+  dream_collect_levels "$only"
+  local total=${#DREAM_LEVELS[@]} i=0
+  local level rel ws code reason line f base slug type desc created updated date age
+  local n_entries expected wslug links tab=$'\t' nl=$'\n' fpath
+  local rows="" unusable="" stale="" large="" drift="" hygiene=""
+  while [ "$i" -lt "$total" ]; do
+    level="${DREAM_LEVELS[$i]}"
+    rel="${DREAM_RELS[$i]}"
+    ws="${rel%%/*}"
+    code=""
+    i=$((i + 1))
+
+    case "$rel" in
+      */projects/*)
+        if [ -f "$level/.project-path" ]; then
+          IFS= read -r code < "$level/.project-path" || true
+          code="${code//$tab/ }"
+        fi
+        reason="$(dream_orphan_reason "$level" "$code")"
+        [ -z "$reason" ] || hygiene="$hygiene  orphan project: $rel ($reason)$nl"
+        ;;
+    esac
+
+    if [ -f "$level/INDEX.md" ]; then
+      n_entries="$(grep -c '^- \[' "$level/INDEX.md" || true)"
+      [ "$n_entries" -le 40 ] || large="$large  $rel/INDEX.md ($n_entries entries)$nl"
+      expected="$(render_index "$level" "$rel" 2>/dev/null)"
+      [ "$expected" = "$(<"$level/INDEX.md")" ] || drift="$drift  $rel/INDEX.md (differs from the facts)$nl"
+    else
+      drift="$drift  $rel/INDEX.md (missing)$nl"
+    fi
+
+    for f in "$level"/*.md; do
+      [ -e "$f" ] || [ -L "$f" ] || continue
+      base="${f##*/}"
+      [ "$base" = "INDEX.md" ] && continue
+      slug="${base%.md}"
+      fpath="$(dream_fact_path "$rel" "$base" "$code")"
+      if [ ! -f "$f" ]; then
+        unusable="$unusable  $fpath — not a regular file$nl"
+        continue
+      fi
+      if ! reason="$(fact_is_usable "$f")"; then
+        reason="$(printf '%s\n' "$reason" | while IFS= read -r line; do printf '%s; ' "${line%": $f"}"; done)"
+        unusable="$unusable  $fpath — ${reason%; }$nl"
+        continue
+      fi
+
+      type="$(frontmatter_value "$f" type)"
+      desc="$(frontmatter_value "$f" description)"
+      desc="${desc//$tab/ }"
+      created="$(frontmatter_value "$f" created)"
+      updated="$(frontmatter_value "$f" updated)"
+      date="$created"
+      [ -z "$updated" ] || date="$updated"
+      rows="$rows$rel$tab$ws$tab$slug$tab$type$tab$desc$tab$date$tab$code$nl"
+
+      age=$((today_days - $(days_from_civil "$date")))
+      [ "$age" -le "$stale_days" ] || stale="$stale  $fpath — $type, ${age}d since $date$nl"
+      [ "${#desc}" -le 120 ] || hygiene="$hygiene  long description (${#desc} chars): $fpath$nl"
+      # A here-string, not `< <(...)`: bash 3.2 leaks a descriptor per process
+      # substitution and dies with SIGTRAP after a few hundred facts.
+      links="$(grep -o '\[\[[a-z0-9-]*\]\]' "$f" | sed 's/^\[\[//; s/\]\]$//' | LC_ALL=C sort -u || true)"
+      while IFS= read -r wslug; do
+        [ -n "$wslug" ] || continue
+        dream_wiki_exists "$ws" "$wslug" || hygiene="$hygiene  dangling link: $fpath -> [[$wslug]]$nl"
+      done <<< "$links"
+    done
+  done
+
+  local pairs="" similar="" repeated="" shadowed=""
+  if [ -n "$rows" ]; then
+    pairs="$(printf '%s' "$rows" | LC_ALL=C sort | dream_pairs)"
+    similar="$(printf '%s\n' "$pairs" | dream_tag S)"
+    repeated="$(printf '%s\n' "$pairs" | dream_tag R)"
+    shadowed="$(printf '%s\n' "$pairs" | dream_tag H)"
+  fi
+
+  dream_emit "unusable facts (fix frontmatter):" "${unusable%"$nl"}"
+  dream_emit "similar facts (merge, or check for contradiction):" "$similar"
+  dream_emit "repeated across projects (move shared part to a group or workspace):" "$repeated"
+  dream_emit "same slug in several levels (shadowing):" "$shadowed"
+  dream_emit "stale facts (older than $stale_days days — verify, update 'updated:', or delete):" "${stale%"$nl"}"
+  dream_emit "large indexes (> 40 entries — merge or prune):" "${large%"$nl"}"
+  dream_emit "index drift (run 'memory dream' or 'memory index'):" "${drift%"$nl"}"
+  dream_emit "hygiene:" "${hygiene%"$nl"}"
+
+  local a b c d e
+  a="$(dream_count "$similar")"
+  b="$(dream_count "$repeated")"
+  c="$(dream_count "$shadowed")"
+  d="$(dream_count "${stale%"$nl"}")"
+  e="$(dream_count "${unusable%"$nl"}")"
+  if [ $((a + b + c + d + e)) -eq 0 ]; then
+    echo "dream: memory is tidy — nothing to consolidate"
+  else
+    echo "dream: $a similar, $b repeated across projects, $c shadowed, $d stale, $e unusable"
+  fi
+}
+
+# Rebuild INDEX.md of every store level in scope (all, or one workspace).
+index_rebuild_levels() {   # index_rebuild_levels [<workspace>]
+  local i=0
+  dream_collect_levels "${1:-}"
+  PUBLISH_LEVELS=()
+  PUBLISH_LABELS=()
+  while [ "$i" -lt "${#DREAM_LEVELS[@]}" ]; do
+    if [ -d "${DREAM_LEVELS[$i]}/INDEX.md" ]; then
+      echo "memory: not reindexing ${DREAM_RELS[$i]}: INDEX.md is a directory" >&2
+    else
+      PUBLISH_LEVELS+=("${DREAM_LEVELS[$i]}")
+      PUBLISH_LABELS+=("${DREAM_RELS[$i]}")
+    fi
+    i=$((i + 1))
+  done
+  [ "${#PUBLISH_LEVELS[@]}" -gt 0 ] || return 0
+  publish_indexes >/dev/null
+}
+
+# Replace every __NAME__ placeholder of a template. Placeholder values were
+# checked for JSON-unsafe characters by the caller. patsub_replacement (bash
+# 5.2+) would give '&' in a value a special meaning, so it is turned off.
+dream_render() {   # dream_render <template> <store> <memory-bin> <home>
+  shopt -u patsub_replacement 2>/dev/null || true
+  local text="$1"
+  text="${text//__STORE__/$2}"
+  text="${text//__MEMORY_BIN__/$3}"
+  text="${text//__HOME__/$4}"
+  printf '%s\n' "$text"
+}
+
+cmd_dream() {
+  local usage="usage: memory dream [--report [--stale-days N]] [--workspace <ws>] [--model <provider/model>] [--print-config]"
+  # AGENT_MEMORY_DREAM_MODEL sets the default model; --model overrides it.
+  local report=0 stale_days="" workspace="" model="${AGENT_MEMORY_DREAM_MODEL:-}" print_config=0 model_flag=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --report) report=1; shift ;;
+      --print-config) print_config=1; shift ;;
+      --stale-days)
+        [ $# -ge 2 ] || die "$usage"
+        case "$2" in ''|*[!0-9]*) die "$usage" ;; esac
+        [ "$((10#$2))" -gt 0 ] || die "$usage"
+        stale_days="$((10#$2))"; shift 2 ;;
+      --workspace)
+        [ $# -ge 2 ] || die "$usage"
+        workspace="$2"; shift 2 ;;
+      --model)
+        [ $# -ge 2 ] && [ -n "$2" ] || die "$usage"
+        model="$2"; model_flag=1; shift 2 ;;
+      *) die "$usage" ;;
+    esac
+  done
+  if [ "$report" -eq 1 ]; then
+    { [ "$model_flag" -eq 0 ] && [ "$print_config" -eq 0 ]; } || die "$usage"
+  else
+    [ -z "$stale_days" ] || die "$usage"
+  fi
+  [ -n "$stale_days" ] || stale_days=180
+
+  [ -d "$MEMORY_HOME" ] || die "no store at $MEMORY_HOME (run 'memory init' first)"
+  STORE_HOME="$(cd -P "$MEMORY_HOME" && pwd -P)"
+  if [ -n "$workspace" ]; then
+    require_slug "workspace name" "$workspace"
+    [ -d "$STORE_HOME/$workspace" ] || die "no such workspace in the store: $workspace"
+  fi
+
+  if [ "$report" -eq 1 ]; then
+    dream_report "$stale_days" "$workspace"
+    return 0
+  fi
+
+  [ -d "$STORE_HOME/.git" ] || die "store at $STORE_HOME is not a git repository (run 'memory init' first)"
+  if [ "$print_config" -eq 0 ]; then
+    command -v opencode >/dev/null 2>&1 || die "opencode not found on PATH"
+  fi
+
+  local script assets config prompt nlchar=$'\n' bs=$'\\' quote='"' bad
+  script="$(canonical_path "${BASH_SOURCE[0]}")" || die "cannot resolve CLI path"
+  assets="$(cd -P "$(dirname "$script")/.." && pwd -P)/dream"
+  [ -f "$assets/opencode.json" ] && [ -f "$assets/prompt.md" ] || die "dream assets not found in $assets"
+  for bad in "$STORE_HOME" "$HOME" "$script"; do
+    case "$bad" in
+      *"$quote"*|*"$bs"*|*"$nlchar"*) die "cannot run dream: path contains a quote, backslash or newline: $bad" ;;
+    esac
+  done
+  config="$(<"$assets/opencode.json")"
+  prompt="$(<"$assets/prompt.md")"
+  config="$(dream_render "$config" "$STORE_HOME" "$script" "$HOME")"
+  prompt="$(dream_render "$prompt" "$STORE_HOME" "$script" "$HOME")"
+  [ -z "$workspace" ] || prompt="$prompt${nlchar}${nlchar}Workspace scope: $workspace"
+
+  if [ "$print_config" -eq 1 ]; then
+    printf '%s\n---\n%s\n' "$config" "$prompt"
+    return 0
+  fi
+
+  # Commit pending changes first so the dream result is its own revertable commit.
+  if [ -n "$(git -C "$STORE_HOME" status --porcelain --untracked-files=all)" ]; then
+    cmd_backup >/dev/null
+    echo "dream: committed pending store changes first"
+  fi
+  local pre="" rc=0
+  pre="$(git -C "$STORE_HOME" rev-parse -q --verify HEAD 2>/dev/null || true)"
+
+  # AGENT_MEMORY_HOME is pinned so the agent's `memory dream --report` sees
+  # this store even when the caller passed a relative path.
+  (cd "$STORE_HOME" && AGENT_MEMORY_HOME="$STORE_HOME" OPENCODE_CONFIG_CONTENT="$config" \
+    opencode run --standalone --agent memory-dream \
+    ${model:+--model "$model"} "$prompt") || rc=$?
+  [ "$rc" -eq 0 ] || die "opencode run failed (exit $rc); store changes, if any, are left uncommitted for review"
+
+  index_rebuild_levels "$workspace"
+  cmd_backup >/dev/null
+
+  local base="$pre"
+  [ -n "$base" ] || base="$(git -C "$STORE_HOME" hash-object -t tree /dev/null)"
+  if git -C "$STORE_HOME" rev-parse -q --verify HEAD >/dev/null 2>&1 \
+     && [ -n "$(git -C "$STORE_HOME" diff --stat "$base" HEAD)" ]; then
+    local since="the start"
+    [ -z "$pre" ] || since="$(git -C "$STORE_HOME" rev-parse --short "$pre")"
+    echo "dream: changes since $since:"
+    git -C "$STORE_HOME" diff --stat "$base" HEAD
+  else
+    echo "dream: no changes"
+  fi
 }
 
 # Number of fact files in a level directory (INDEX.md excluded).
@@ -900,7 +1346,7 @@ main() {
   [ $# -gt 0 ] && shift
   case "$cmd" in
     init) cmd_init "$@" ;; link-group) cmd_link_group "$@" ;; unlink-group) cmd_unlink_group "$@" ;;
-    index) cmd_index "$@" ;; status) cmd_status "$@" ;; grep) cmd_grep "$@" ;; doctor) cmd_doctor "$@" ;; backup) cmd_backup "$@" ;; install-opencode) cmd_install_opencode "$@" ;;
+    index) cmd_index "$@" ;; status) cmd_status "$@" ;; grep) cmd_grep "$@" ;; doctor) cmd_doctor "$@" ;; dream) cmd_dream "$@" ;; backup) cmd_backup "$@" ;; install-opencode) cmd_install_opencode "$@" ;;
     -v|--version) [ $# -eq 0 ] || die "usage: memory --version"; echo "memory $VERSION" ;;
     -h|--help) [ $# -eq 0 ] || die "usage: memory --help"; usage ;;
     "") usage >&2; exit 1 ;;
@@ -908,4 +1354,7 @@ main() {
   esac
 }
 
-main "$@"
+# `exit` on the same line: bash reads a script as it runs, so without it an
+# edit or `git pull` of this file during a long `memory dream` would make bash
+# execute whatever bytes now follow this line.
+main "$@"; exit $?
