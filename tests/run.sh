@@ -1800,6 +1800,65 @@ test_dream_run_if_changed_skips_when_store_is_unchanged() {
   assert_eq "$(git -C "$AGENT_MEMORY_HOME" rev-parse refs/memory-dream/last)" "$before"
 }
 
+# A stub that, like the OpenCode plugin after an agent step, runs
+# `memory backup` in the middle of the dream run.
+install_backup_calling_stub() {
+  cat > "$TMP/bin/opencode" <<'EOF'
+#!/usr/bin/env bash
+printf -- '---\ndescription: mid-run edit\ntype: decision\ncreated: 2026-09-04\n---\nbody\n' \
+  > work/projects/some-api/mid-run.md
+"$MEMORY_BIN" backup > "$STUB_LOG/backup-out" 2>&1
+[ -f .git/memory-dream.lock ] && echo held > "$STUB_LOG/lock"
+printf '%s\n' "$@" > "$STUB_LOG/args"
+exit "${STUB_EXIT:-0}"
+EOF
+  chmod +x "$TMP/bin/opencode"
+}
+
+test_dream_run_holds_lock_so_other_backups_wait() {
+  dream_launch_fixture
+  install_backup_calling_stub
+  local base
+  base="$(commit_count)"
+  MEMORY_BIN="$MEMORY" "$MEMORY" dream >/dev/null
+  assert_contains "$(<"$STUB_LOG/backup-out")" "'memory dream' is running"
+  assert_eq "$(<"$STUB_LOG/lock")" "held"
+  # One commit for the whole run, holding the mid-run edit; the lock is gone.
+  assert_eq "$(commit_count)" "$((base + 1))"
+  git -C "$AGENT_MEMORY_HOME" show --name-only --format= HEAD | grep -q 'mid-run.md' \
+    || fail "mid-run edit not in the dream commit"
+  [ ! -e "$AGENT_MEMORY_HOME/.git/memory-dream.lock" ] || fail "lock left behind"
+  dfact "$DP1" after-run convention "written after the run" 2026-09-30
+  assert_contains "$("$MEMORY" backup)" "backed up"
+}
+
+test_dream_run_releases_lock_on_failure_and_ignores_stale_lock() {
+  dream_launch_fixture
+  STUB_EXIT=1 "$MEMORY" dream >/dev/null 2>&1 || true
+  [ ! -e "$AGENT_MEMORY_HOME/.git/memory-dream.lock" ] || fail "lock left after a failed run"
+  # A lock left by a dead process blocks neither backup nor dream.
+  printf '999999\n' > "$AGENT_MEMORY_HOME/.git/memory-dream.lock"
+  dfact "$DP1" some-fact convention "a convention" 2026-09-30
+  assert_contains "$("$MEMORY" backup)" "backed up"
+  printf '999999\n' > "$AGENT_MEMORY_HOME/.git/memory-dream.lock"
+  rm -f "$STUB_LOG/args"
+  "$MEMORY" dream >/dev/null
+  assert_file "$STUB_LOG/args"
+}
+
+test_dream_run_refuses_a_second_concurrent_run() {
+  dream_launch_fixture
+  sleep 30 &
+  local live=$! out rc=0
+  printf '%s\n' "$live" > "$AGENT_MEMORY_HOME/.git/memory-dream.lock"
+  out="$("$MEMORY" dream 2>&1)" || rc=$?
+  kill "$live" 2>/dev/null || true
+  wait "$live" 2>/dev/null || true
+  assert_eq "$rc" 1
+  assert_contains "$out" "already running on this store (pid $live)"
+  [ ! -e "$STUB_LOG/args" ] || fail "second run launched opencode"
+}
+
 test_dream_run_rebuilds_indexes_and_commits() {
   dream_launch_fixture
   local base out

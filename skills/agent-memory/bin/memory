@@ -421,7 +421,16 @@ render_index() {
   done
 }
 
-# shellcheck disable=SC2329 # invoked from the traps in publish_indexes
+# Lock of a live `memory dream`; removed on exit or signal by cleanup_on_exit.
+DREAM_LOCK_FILE=""
+
+# shellcheck disable=SC2329 # invoked from traps
+cleanup_on_exit() {
+  cleanup_index_temps
+  [ -z "$DREAM_LOCK_FILE" ] || rm -f "$DREAM_LOCK_FILE"
+}
+
+# shellcheck disable=SC2329 # called from cleanup_on_exit
 cleanup_index_temps() {
   local temp
   [ "${#INDEX_TEMP_FILES[@]}" -gt 0 ] || return 0
@@ -437,8 +446,8 @@ publish_indexes() {
   local i level temp n
   local -a temps=()
   INDEX_TEMP_FILES=()
-  trap 'cleanup_index_temps' EXIT
-  trap 'cleanup_index_temps; exit 1' HUP INT TERM
+  trap 'cleanup_on_exit' EXIT
+  trap 'cleanup_on_exit; exit 1' HUP INT TERM
   i=0
   while [ "$i" -lt "${#PUBLISH_LEVELS[@]}" ]; do
     level="${PUBLISH_LEVELS[$i]}"
@@ -461,7 +470,8 @@ publish_indexes() {
     i=$((i + 1))
   done
   INDEX_TEMP_FILES=()
-  trap - EXIT HUP INT TERM
+  # While a dream lock is held the traps stay; they then only remove the lock.
+  [ -n "$DREAM_LOCK_FILE" ] || trap - EXIT HUP INT TERM
 }
 
 cmd_index() {
@@ -1033,6 +1043,15 @@ cmd_dream() {
     return 0
   fi
 
+  local holder
+  holder="$(dream_lock_holder)"
+  [ -z "$holder" ] || die "another 'memory dream' is already running on this store (pid $holder)"
+  DREAM_LOCK_FILE="$STORE_HOME/.git/memory-dream.lock"
+  printf '%s\n' "$$" > "$DREAM_LOCK_FILE"
+  DREAM_LOCK_OWNER="$$"
+  trap 'cleanup_on_exit' EXIT
+  trap 'cleanup_on_exit; exit 1' HUP INT TERM
+
   # AGENT_MEMORY_HOME is pinned so the agent's `memory dream --report` sees
   # this store even when the caller passed a relative path.
   (cd "$STORE_HOME" && AGENT_MEMORY_HOME="$STORE_HOME" OPENCODE_CONFIG_CONTENT="$config" \
@@ -1042,6 +1061,9 @@ cmd_dream() {
 
   index_rebuild_levels "$workspace"
   cmd_backup >/dev/null
+  rm -f "$DREAM_LOCK_FILE"
+  DREAM_LOCK_FILE=""
+  trap - EXIT HUP INT TERM
   if git -C "$STORE_HOME" rev-parse -q --verify HEAD >/dev/null 2>&1; then
     git -C "$STORE_HOME" update-ref "$last_ref" HEAD
   fi
@@ -1317,10 +1339,28 @@ backup_commit_message() {
   '
 }
 
+# PID of a live `memory dream` run on this store, or nothing. A lock left by a
+# dead process is removed.
+dream_lock_holder() {
+  local lock="$MEMORY_HOME/.git/memory-dream.lock" pid=""
+  [ -f "$lock" ] || return 0
+  IFS= read -r pid < "$lock" || true
+  case "$pid" in ''|*[!0-9]*) rm -f "$lock"; return 0 ;; esac
+  if kill -0 "$pid" 2>/dev/null; then echo "$pid"; else rm -f "$lock"; fi
+}
+
 cmd_backup() {
-  local push=0
+  local push=0 holder
   case "$#" in 0) ;; 1) [ "$1" = "--push" ] || die "usage: memory backup [--push]"; push=1 ;; *) die "usage: memory backup [--push]" ;; esac
   [ -d "$MEMORY_HOME/.git" ] || die "no store at $MEMORY_HOME (run 'memory init' first)"
+  # While `memory dream` runs, other backups (the OpenCode plugin commits after
+  # every agent step, in any session) would split its result into many commits.
+  # Dream commits everything itself when it finishes.
+  holder="$(dream_lock_holder)"
+  if [ -n "$holder" ] && [ "${DREAM_LOCK_OWNER:-}" != "$holder" ]; then
+    echo "memory: 'memory dream' is running (pid $holder); skipping backup — it commits when it finishes"
+    return 0
+  fi
   git -C "$MEMORY_HOME" add -A
   if git -C "$MEMORY_HOME" diff --cached --quiet 2>/dev/null && git -C "$MEMORY_HOME" rev-parse -q --verify HEAD >/dev/null; then
     echo "nothing to back up"
