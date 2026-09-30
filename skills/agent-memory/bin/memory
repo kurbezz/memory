@@ -1035,11 +1035,14 @@ cmd_dream() {
   pre="$(git -C "$STORE_HOME" rev-parse -q --verify HEAD 2>/dev/null || true)"
   [ -z "$workspace" ] || last_ref="$last_ref-$workspace"
 
-  # --if-changed: skip when nothing was committed since the last successful
-  # run (a local ref, never pushed), so a nightly job costs nothing on quiet days.
-  if [ "$if_changed" -eq 1 ] && [ -n "$pre" ] \
-     && [ "$(git -C "$STORE_HOME" rev-parse -q --verify "$last_ref" 2>/dev/null || true)" = "$pre" ]; then
-    echo "dream: no changes since the last run — skipping"
+  # --if-changed: skip when no fact changed since the last successful run
+  # (a local ref, never pushed), so a nightly job costs nothing on quiet days.
+  # Only fact files count: INDEX.md, .project-path and the like are ignored.
+  local last=""
+  last="$(git -C "$STORE_HOME" rev-parse -q --verify "$last_ref" 2>/dev/null || true)"
+  if [ "$if_changed" -eq 1 ] && [ -n "$pre" ] && [ -n "$last" ] \
+     && [ -z "$(git -C "$STORE_HOME" diff --name-only "$last" "$pre" -- '*.md' ':!*INDEX.md' ${workspace:+"$workspace/"})" ]; then
+    echo "dream: no fact changed since the last run — skipping"
     return 0
   fi
 

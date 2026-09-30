@@ -1781,8 +1781,16 @@ test_dream_run_if_changed_skips_when_store_is_unchanged() {
   assert_eq "$(git -C "$AGENT_MEMORY_HOME" rev-parse refs/memory-dream/last)" "$(git -C "$AGENT_MEMORY_HOME" rev-parse HEAD)"
   rm -f "$STUB_LOG/args"
   out="$("$MEMORY" dream --if-changed)"
-  assert_contains "$out" "dream: no changes since the last run — skipping"
+  assert_contains "$out" "dream: no fact changed since the last run — skipping"
   [ ! -e "$STUB_LOG/args" ] || fail "opencode ran although nothing changed"
+  # Commits that touch no fact (an index rebuild, a new project) do not count.
+  printf '%s\n' "- touched" >> "$DP1/INDEX.md"
+  "$MEMORY" backup >/dev/null
+  "$MEMORY" index >/dev/null
+  "$MEMORY" backup >/dev/null
+  out="$("$MEMORY" dream --if-changed)"
+  assert_contains "$out" "skipping"
+  [ ! -e "$STUB_LOG/args" ] || fail "opencode ran after an index-only commit"
   # A new fact (even uncommitted) makes the next run happen.
   dfact "$DP1" new-fact convention "a brand new convention" 2026-09-30
   out="$("$MEMORY" dream --if-changed)"
