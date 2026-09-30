@@ -35,7 +35,7 @@ commands:
   grep <pattern> [grep opts]                search all linked levels (follows the symlinks)
   doctor                                    check symlinks, indexes, frontmatter
   dream --report [--stale-days N] [--workspace <ws>]  read-only whole-store report: duplicates, stale facts
-  dream [--workspace <ws>] [--model <m>] [--print-config]  tidy the whole store with a sandboxed OpenCode run
+  dream [--workspace <ws>] [--model <m>] [--if-changed] [--print-config]  tidy the whole store with a sandboxed OpenCode run
   backup [--push]                           commit (and push) the store
   install-opencode                          install the global OpenCode plugin
 EOF
@@ -950,13 +950,14 @@ dream_render() {   # dream_render <template> <store> <memory-bin> <home>
 }
 
 cmd_dream() {
-  local usage="usage: memory dream [--report [--stale-days N]] [--workspace <ws>] [--model <provider/model>] [--print-config]"
+  local usage="usage: memory dream [--report [--stale-days N]] [--workspace <ws>] [--model <provider/model>] [--if-changed] [--print-config]"
   # AGENT_MEMORY_DREAM_MODEL sets the default model; --model overrides it.
-  local report=0 stale_days="" workspace="" model="${AGENT_MEMORY_DREAM_MODEL:-}" print_config=0 model_flag=0
+  local report=0 stale_days="" workspace="" model="${AGENT_MEMORY_DREAM_MODEL:-}" print_config=0 model_flag=0 if_changed=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --report) report=1; shift ;;
       --print-config) print_config=1; shift ;;
+      --if-changed) if_changed=1; shift ;;
       --stale-days)
         [ $# -ge 2 ] || die "$usage"
         case "$2" in ''|*[!0-9]*) die "$usage" ;; esac
@@ -972,7 +973,7 @@ cmd_dream() {
     esac
   done
   if [ "$report" -eq 1 ]; then
-    { [ "$model_flag" -eq 0 ] && [ "$print_config" -eq 0 ]; } || die "$usage"
+    { [ "$model_flag" -eq 0 ] && [ "$print_config" -eq 0 ] && [ "$if_changed" -eq 0 ]; } || die "$usage"
   else
     [ -z "$stale_days" ] || die "$usage"
   fi
@@ -1020,8 +1021,17 @@ cmd_dream() {
     cmd_backup >/dev/null
     echo "dream: committed pending store changes first"
   fi
-  local pre="" rc=0
+  local pre="" rc=0 last_ref="refs/memory-dream/last"
   pre="$(git -C "$STORE_HOME" rev-parse -q --verify HEAD 2>/dev/null || true)"
+  [ -z "$workspace" ] || last_ref="$last_ref-$workspace"
+
+  # --if-changed: skip when nothing was committed since the last successful
+  # run (a local ref, never pushed), so a nightly job costs nothing on quiet days.
+  if [ "$if_changed" -eq 1 ] && [ -n "$pre" ] \
+     && [ "$(git -C "$STORE_HOME" rev-parse -q --verify "$last_ref" 2>/dev/null || true)" = "$pre" ]; then
+    echo "dream: no changes since the last run — skipping"
+    return 0
+  fi
 
   # AGENT_MEMORY_HOME is pinned so the agent's `memory dream --report` sees
   # this store even when the caller passed a relative path.
@@ -1032,6 +1042,9 @@ cmd_dream() {
 
   index_rebuild_levels "$workspace"
   cmd_backup >/dev/null
+  if git -C "$STORE_HOME" rev-parse -q --verify HEAD >/dev/null 2>&1; then
+    git -C "$STORE_HOME" update-ref "$last_ref" HEAD
+  fi
 
   local base="$pre"
   [ -n "$base" ] || base="$(git -C "$STORE_HOME" hash-object -t tree /dev/null)"

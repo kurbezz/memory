@@ -1496,7 +1496,7 @@ test_dream_report_rejects_bad_arguments() {
   local out rc args
   for args in "--report --stale-days 0" "--report --stale-days abc" "--report --stale-days -5" \
               "--report --stale-days" "--report --stale-days 1.5" "--report --bogus" \
-              "--report --model x/y" "--stale-days 5" "--report extra"; do
+              "--report --model x/y" "--report --if-changed" "--stale-days 5" "--report extra"; do
     rc=0
     # shellcheck disable=SC2086 # Word splitting of the fixed argument lists is intended.
     out="$("$MEMORY" dream $args 2>&1)" || rc=$?
@@ -1770,6 +1770,34 @@ example/flag"
   assert_not_contains "$(<"$STUB_LOG/args")" "from-env"
   # The env default must not make --report reject its arguments.
   AGENT_MEMORY_DREAM_MODEL=example/from-env "$MEMORY" dream --report >/dev/null
+}
+
+test_dream_run_if_changed_skips_when_store_is_unchanged() {
+  dream_launch_fixture
+  local out
+  # First run: no record of a previous run, so it runs and records HEAD.
+  out="$("$MEMORY" dream --if-changed)"
+  assert_not_contains "$out" "skipping"
+  assert_eq "$(git -C "$AGENT_MEMORY_HOME" rev-parse refs/memory-dream/last)" "$(git -C "$AGENT_MEMORY_HOME" rev-parse HEAD)"
+  rm -f "$STUB_LOG/args"
+  out="$("$MEMORY" dream --if-changed)"
+  assert_contains "$out" "dream: no changes since the last run — skipping"
+  [ ! -e "$STUB_LOG/args" ] || fail "opencode ran although nothing changed"
+  # A new fact (even uncommitted) makes the next run happen.
+  dfact "$DP1" new-fact convention "a brand new convention" 2026-09-30
+  out="$("$MEMORY" dream --if-changed)"
+  assert_not_contains "$out" "skipping"
+  assert_file "$STUB_LOG/args"
+  # Without the flag it always runs.
+  rm -f "$STUB_LOG/args"
+  "$MEMORY" dream >/dev/null
+  assert_file "$STUB_LOG/args"
+  # A failed run does not move the marker.
+  local before
+  before="$(git -C "$AGENT_MEMORY_HOME" rev-parse refs/memory-dream/last)"
+  dfact "$DP1" another-fact convention "yet another convention" 2026-09-30
+  STUB_EXIT=1 "$MEMORY" dream --if-changed >/dev/null 2>&1 || true
+  assert_eq "$(git -C "$AGENT_MEMORY_HOME" rev-parse refs/memory-dream/last)" "$before"
 }
 
 test_dream_run_rebuilds_indexes_and_commits() {

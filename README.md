@@ -91,6 +91,8 @@ workspace.
 - `memory dream [--workspace <ws>] [--model <provider/model>]` — an unattended
   OpenCode agent works through the report and fixes the store.
   `--print-config` shows the exact config and prompt without running anything.
+  `--if-changed` skips the run when nothing was committed to the store since
+  the last successful run, for use from a nightly scheduler (launchd, cron).
   Without `--model` it uses `AGENT_MEMORY_DREAM_MODEL`, or OpenCode's default
   model. The consolidation is judgment work, so a strong model is worth it: in
   testing, a small model read 35 of 500 facts and changed only descriptions.
