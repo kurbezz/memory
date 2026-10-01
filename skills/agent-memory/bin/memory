@@ -1086,9 +1086,16 @@ cmd_dream() {
   trap 'cleanup_on_exit' EXIT
   trap 'cleanup_on_exit; exit 1' HUP INT TERM
 
+  # The run gets its own OpenCode database so the unattended session stays out
+  # of the user's OpenCode session list. Inside .git it is never committed;
+  # wiping it first keeps only the latest run's session and bounds its size.
+  local db="$STORE_HOME/.git/memory-dream.db"
+  rm -f "$db" "$db-wal" "$db-shm"
+
   # AGENT_MEMORY_HOME is pinned so the agent's `memory dream --report` sees
   # this store even when the caller passed a relative path.
   (cd "$STORE_HOME" && AGENT_MEMORY_HOME="$STORE_HOME" OPENCODE_CONFIG_CONTENT="$config" \
+    OPENCODE_DB="$db" \
     opencode run --standalone --agent memory-dream \
     ${model:+--model "$model"} "$prompt") || rc=$?
   [ "$rc" -eq 0 ] || die "opencode run failed (exit $rc); store changes, if any, are left uncommitted for review"
@@ -1113,6 +1120,7 @@ cmd_dream() {
   else
     echo "dream: no changes"
   fi
+  echo "dream: session transcript in $db (latest run only)"
 }
 
 # Number of fact files in a level directory (INDEX.md excluded).

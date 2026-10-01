@@ -12,6 +12,7 @@ setup() {
   export AGENT_MEMORY_HOME="$TMP/store"
   export HOME="$TMP/home"                 # isolates global git config too
   unset XDG_CONFIG_HOME                   # CI runners set it; config must follow $HOME
+  unset AGENT_MEMORY_DREAM_MODEL          # a user's shell default must not leak into the dream tests
   export GIT_CONFIG_NOSYSTEM=1
   mkdir -p "$HOME"
   git config --global user.email "test@example.com"
@@ -1621,6 +1622,12 @@ install_opencode_stub() {
 pwd -P > "$STUB_LOG/pwd"
 printf '%s\n' "$@" > "$STUB_LOG/args"
 printf '%s' "${OPENCODE_CONFIG_CONTENT:-}" > "$STUB_LOG/config"
+printf '%s' "${OPENCODE_DB:-}" > "$STUB_LOG/db"
+if [ -e "${OPENCODE_DB:-}" ] || [ -e "${OPENCODE_DB:-}-wal" ] || [ -e "${OPENCODE_DB:-}-shm" ]; then
+  echo yes > "$STUB_LOG/db-existed"
+else
+  echo no > "$STUB_LOG/db-existed"
+fi
 git status --porcelain --untracked-files=all > "$STUB_LOG/status-at-run"
 git log --oneline | wc -l | tr -d ' ' > "$STUB_LOG/commits-at-run"
 if [ -n "${STUB_EDIT:-}" ]; then
@@ -1749,6 +1756,33 @@ test_dream_run_launches_from_store_with_agent_and_config() {
   assert_contains "$(<"$STUB_LOG/config")" "\"default_agent\": \"memory-dream\""
   assert_not_contains "$(<"$STUB_LOG/config")" "__STORE__"
   assert_not_contains "$(<"$STUB_LOG/args")" "--model"
+  assert_eq "$(<"$STUB_LOG/db")" "$(cd -P "$AGENT_MEMORY_HOME" && pwd -P)/.git/memory-dream.db"
+}
+
+test_dream_run_starts_with_a_fresh_untracked_db() {
+  dream_launch_fixture
+  local db
+  db="$AGENT_MEMORY_HOME/.git/memory-dream.db"
+  echo stale > "$db"
+  echo stale > "$db-wal"
+  local out
+  out="$("$MEMORY" dream)"
+  assert_eq "$(<"$STUB_LOG/db-existed")" "no"
+  assert_contains "$out" "dream: session transcript in "
+  assert_not_contains "$(<"$STUB_LOG/status-at-run")" "memory-dream.db"
+  assert_not_contains "$(git -C "$AGENT_MEMORY_HOME" status --porcelain --untracked-files=all)" "memory-dream.db"
+}
+
+test_dream_report_and_print_config_keep_the_db() {
+  dream_launch_fixture
+  local db
+  db="$AGENT_MEMORY_HOME/.git/memory-dream.db"
+  echo keep > "$db"
+  "$MEMORY" dream --report >/dev/null
+  assert_file "$db"
+  "$MEMORY" dream --print-config >/dev/null
+  assert_file "$db"
+  assert_eq "$(<"$db")" "keep"
 }
 
 test_dream_run_passes_model_and_workspace() {

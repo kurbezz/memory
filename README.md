@@ -114,9 +114,11 @@ and the only subagent is a read-only checker. The boundary is enforced through
 OpenCode `experimental.policies`, which a project's `opencode.json` cannot
 override. It runs `opencode run --standalone` from the store directory with the
 config passed in `OPENCODE_CONFIG_CONTENT`, so your OpenCode config files are
-not modified. Your global config and plugins still load, and the sandbox
-config is merged on top of them. `memory dream --print-config` shows the exact
-rules.
+not modified. The run uses its own OpenCode database at
+`<store>/.git/memory-dream.db`, which holds the latest run only, so dream
+sessions never show up in OpenCode's session list. Your global config and
+plugins still load, and the sandbox config is merged on top of them.
+`memory dream --print-config` shows the exact rules.
 
 The store is committed before the run (if it has pending changes) and after it;
 nothing is ever pushed. To undo a run:
